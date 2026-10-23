@@ -2,842 +2,1003 @@
 #
 # mockvps-vbox.sh -- spin up a disposable Debian "VPS" locally with VirtualBox
 #
-# Sets up VirtualBox, boots an unattended Debian install, and leaves you with
-# a running VM reachable via SSH **from this host only**.
+# Boots an unattended, headless Debian install in VirtualBox and leaves you
+# with a VM reachable over key-only SSH from this host only.
+#
+# Revised version. Compared with the original it:
+#   * never force-kills libvirt/KVM VMs (KVM is only touched with --stop-kvm,
+#     and then only after a graceful ACPI shutdown),
+#   * only installs VirtualBox when it is missing (apt-based hosts only),
+#   * works with an existing VirtualBox on any x86_64 Linux host,
+#   * exits non-zero when the install fails or times out,
+#   * verifies the Debian ISO (SHA512SUMS + GPG signature),
+#   * uses a SATA controller, compares port *and* IP of the NAT rule,
+#     clears stale known_hosts entries, replaces the TCP serial listener with
+#     a log file, and supports extra SSH tunnels (-f/--forward).
 #
 # Security model:
-#   * NAT port-forward is bound to 127.0.0.1, not 0.0.0.0 -- other machines on
-#     the LAN cannot reach the guest's SSH. Override with SSH_HOST_IP.
-#   * No serial/TCP console listener by default. VirtualBox 7.x cannot bind
-#     that listener to loopback, so SERIAL=1 (opt-in) re-opens it on ALL
-#     interfaces -- only enable it behind a host firewall.
-#   * No hardcoded credentials: a random guest password is generated once and
-#     stored 0600 in "$WORKDIR/credentials/${VM_NAME}.env". SSH access to the
-#     guest uses a dedicated Ed25519 key; the guest's SSH password auth is
-#     disabled during the install. The password remains a fallback for the
-#     local console only and never travels in shell history or CLI args.
+#   * The NAT port-forward is bound to 127.0.0.1 -- other machines on the LAN
+#     cannot reach the guest.
+#   * No network listener for the serial console (--serial logs to a file).
+#   * A random guest password is generated once and stored 0600 in
+#     "$WORKDIR/credentials/<name>.env". SSH uses a dedicated Ed25519 key and
+#     password authentication is disabled in the guest.
 #
 # Usage:
-#   ./mockvps-vbox.sh            # full setup + unattended install + wait for SSH
-#   ./mockvps-vbox.sh --help     # all flags (-n/--name, -p/--port, -y/--yes, ...)
-#   ./mockvps-vbox.sh -y         # skip confirmation prompts (destroys an old VM)
-#   MANUAL=1 ./mockvps-vbox.sh   # boot the interactive installer instead
+#   ./mockvps-vbox.sh               # install (typically 10-20 min) + wait for SSH
+#   ./mockvps-vbox.sh --help        # all flags
 #
-# Overridable via flags *or* environment: VM_NAME, VM_VCPUS, VM_MEMORY,
-# VM_DISK_SIZE_MB, VM_USER, VM_PASSWORD, SSH_HOST_PORT, SSH_HOST_IP, WORKDIR,
-# ISO_URL, SERIAL -- run with --help for the full list.
-#
-# After the script:  ssh mockvps-vbox
+# Exit codes: 0 ok, 1 error, 2 install did not complete (VM powered off or
+#             SSH timeout), 3 VM is up but key login failed.
 
 set -euo pipefail
 
-### Config ############################################################
-
-VM_NAME="${VM_NAME:-mockvps-vbox}"
-VM_VCPUS="${VM_VCPUS:-2}"
-VM_MEMORY="${VM_MEMORY:-2048}"          # MiB
-VM_DISK_SIZE_MB="${VM_DISK_SIZE_MB:-20000}"
-WORKDIR="${WORKDIR:-$HOME/vps}"
-DISK="${WORKDIR}/${VM_NAME}.vdi"
-SSH_HOST_PORT="${SSH_HOST_PORT:-2222}"
-SSH_HOST_IP="${SSH_HOST_IP:-127.0.0.1}" # NAT forward bind address (loopback = LAN-safe)
-
-VM_USER="${VM_USER:-vps}"
-CRED_DIR="${WORKDIR}/credentials"
-CRED_FILE="${CRED_DIR}/${VM_NAME}.env"
-KEY_FILE="${HOME}/.ssh/${VM_NAME}_id"   # dedicated host key for this VM
-SSH_MARKER_FILE="${VM_NAME} (managed by mockvps-vbox.sh)"
-
-SERIAL="${SERIAL:-0}"                   # 0 = no TCP serial listener (default)
-REAL_USER="${SUDO_USER:-$USER}"
-
-# Empty = auto-resolve latest Debian netinst from cdimage "current" listing
-ISO_URL="${ISO_URL:-}"
-CDIMAGE_BASE="${CDIMAGE_BASE:-https://cdimage.debian.org/debian-cd/current/amd64/iso-cd}"
-
-MANUAL="${MANUAL:-0}"                   # 1 = boot the interactive installer
+# Debian CD signing keys (https://www.debian.org/CD/verify). Space-separated
+# primary-key fingerprints; add more with --cd-key-fpr.
+DEFAULT_CD_KEY_FPRS="10460DAD76165AD81FBC0CE9988021A964E6EA7D DF9B9C49EAA9298432589D76DA87E80D6294BE9B"
+CD_KEY_SERVERS="hkps://keyring.debian.org hkps://keyserver.ubuntu.com"
 
 ### Helpers ###########################################################
 
-log() { printf '\n==> %s\n' "$*"; }
-die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+log()  { printf '\n==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-is_uint() { [[ "$1" =~ ^[0-9]+$ ]] && [[ $1 -ge $2 ]] && [[ $1 -le $3 ]]; }
+# is_uint VALUE MIN MAX -- decimal integer in range (leading zeros are fine)
+is_uint() { [[ "$1" =~ ^[0-9]{1,9}$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 )); }
+
+as_root() {
+  if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi
+}
+
+confirm() {
+  if [[ $ASSUME_YES -eq 1 ]]; then return 0; fi
+  [[ -t 0 ]] || die "Confirmation needed ('$1') but stdin is not a terminal; re-run with -y."
+  local reply
+  read -r -p "$1 [y/N] " reply
+  [[ "$reply" =~ ^[yY]([eE][sS])?$ ]]
+}
 
 usage() {
-	cat <<EOF
-usage: ${0##*/} [options]
+  cat <<'EOF'
+usage: mockvps-vbox.sh [options]
 
 Set up a disposable Debian server "VPS" locally in VirtualBox: unattended
-install (~5 min), key-only SSH reachable from this host, no GUI. After the
-run: ssh <name>  --  and  http://localhost:8080  reaches the guest's web
-server over an SSH tunnel while the session is open.
+install (typically 10-20 minutes), key-only SSH reachable from this host
+only, no GUI. Afterwards:  ssh <name>
+
+Requires an x86_64 Linux host. If VirtualBox (7.x) is missing, the script
+offers to install it -- on apt-based hosts (Debian/Ubuntu/derivatives) only;
+elsewhere install VirtualBox yourself first.
 
 options:
   -h, --help            show this help and exit
-  -y, --yes             non-interactive; confirms destructive actions
-  -n, --name NAME       VM name                         (default: mockvps-vbox)
-  -u, --user USER       guest user                      (default: vps)
-  -p, --port PORT       host port of the SSH forward    (default: 2222)
-  -c, --cpus N          guest vCPUs                     (default: 2)
-  -m, --memory MIB      guest RAM, MiB                  (default: 2048)
-  -d, --disk MB         guest disk size, MB             (default: 20000)
-  -w, --workdir DIR     state directory                 (default: ~/vps)
-  -i, --iso-url URL     Debian netinst ISO URL          (default: latest auto-detected)
-  -k, --ip IP           bind the NAT forward to this IP (default: 127.0.0.1; use the
-                        loopback default -- only deviate if you know why)
-      --manual          boot the interactive installer instead of unattended mode
-      --serial          expose a TCP serial console on port 4555 for install
-                        output. LISTENS ON ALL INTERFACES (VirtualBox cannot
-                        bind it to loopback) -- host firewall required!
-      --no-web-tunnel   do not write the 8080 LocalForward into ~/.ssh/config
+  -y, --yes             non-interactive; confirms prompts (reinstalls an
+                        existing VM; shuts libvirt VMs down gracefully if
+                        --stop-kvm is also given)
+  -n, --name NAME       VM name (default: mockvps-vbox)
+  -u, --user USER       guest user (default: vps)
+  -p, --port PORT       host port of the SSH forward (default: 2222)
+  -c, --cpus N          guest vCPUs (default: 2)
+  -m, --memory MIB      guest RAM in MiB (default: 2048)
+  -d, --disk MB         guest disk size in MB (default: 20000)
+  -w, --workdir DIR     state directory (default: ~/vps)
+  -i, --iso-url URL|FILE  Debian netinst ISO: a URL or a local file
+                        (default: latest, auto-detected and verified)
+  -f, --forward L:G     also tunnel host port L to guest port G over SSH
+                        (repeatable; L must be 1024-65535), e.g. -f 8443:443
+  -k, --ip IP           bind the NAT forward to this IPv4 address (default
+                        127.0.0.1; only change this if you know why)
+  --manual              boot the interactive installer (GUI) instead
+  --serial              log the guest serial console to
+                        <workdir>/<name>-serial.log (no network listener)
+  --stop-kvm            unload KVM so VirtualBox can run. libvirt VMs are
+                        shut down gracefully, never force-killed
+  --require-signature   fail if the ISO checksum file's GPG signature cannot
+                        be verified (default: warn and rely on the checksum)
+  --cd-key-fpr FPR      accept this additional Debian CD signing key
+  --no-web-tunnel       do not add the default 8080 -> guest:80 tunnel
 
-Every option also has an environment-variable equivalent (VM_NAME, VM_USER,
+Every option has an environment-variable equivalent (VM_NAME, VM_USER,
 SSH_HOST_PORT, VM_VCPUS, VM_MEMORY, VM_DISK_SIZE_MB, WORKDIR, ISO_URL,
-SSH_HOST_IP, MANUAL, SERIAL, WEB_TUNNEL) -- flags win.
-
-Security notes:
-  * The SSH forward always binds 127.0.0.1 unless -k is given.
-  * Guest SSH is key-only; the random guest password is stored 0600 in
-    <workdir>/credentials/<name>.env (local console / sudo fallback only).
-  * A random Ed25519 key <name>_id is generated once in ~/.ssh and wired
-    into ~/.ssh/config via a managed block.
+SSH_HOST_IP, MANUAL, SERIAL, STOP_KVM, REQUIRE_SIG, WEB_TUNNEL=0|1,
+FORWARDS="8443:443,3000:3000"); flags win.
 EOF
 }
 
-parse_args() {
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-			-h|--help)      usage; exit 0 ;;
-			-y|--yes)       ASSUME_YES=1; shift ;;
-			-n|--name)      [[ $# -ge 2 ]] || die "option $1 requires an argument"; [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "invalid name: '$2'"; VM_NAME="$2"; shift 2 ;;
-			-u|--user)      [[ $# -ge 2 ]] || die "option $1 requires an argument"; [[ "$2" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid user name: '$2'"; VM_USER="$2"; shift 2 ;;
-			-p|--port)      [[ $# -ge 2 ]] || die "option $1 requires an argument"; is_uint "$2" 1 65535 || die "invalid port: '$2'"; SSH_HOST_PORT="$2"; shift 2 ;;
-			-c|--cpus)      [[ $# -ge 2 ]] || die "option $1 requires an argument"; is_uint "$2" 1 32 || die "invalid cpu count: '$2'"; VM_VCPUS="$2"; shift 2 ;;
-			-m|--memory)    [[ $# -ge 2 ]] || die "option $1 requires an argument"; is_uint "$2" 512 131072 || die "invalid memory: '$2'"; VM_MEMORY="$2"; shift 2 ;;
-			-d|--disk)      [[ $# -ge 2 ]] || die "option $1 requires an argument"; is_uint "$2" 4000 2097152 || die "invalid disk size: '$2'"; VM_DISK_SIZE_MB="$2"; shift 2 ;;
-			-w|--workdir)   [[ $# -ge 2 ]] || die "option $1 requires an argument"; WORKDIR="$2"; shift 2 ;;
-			-i|--iso-url)   [[ $# -ge 2 ]] || die "option $1 requires an argument"; ISO_URL="$2"; shift 2 ;;
-			-k|--ip)        [[ $# -ge 2 ]] || die "option $1 requires an argument"; SSH_HOST_IP="$2"; shift 2 ;;
-			 --manual)      MANUAL=1; shift ;;
-			 --serial)      SERIAL=1; shift ;;
-			 --no-web-tunnel) WEB_TUNNEL=0; shift ;;
-			-- )            shift; break ;;
-			-*)             die "unknown option: $1 (try --help)" ;;
-			*)              die "unexpected argument: $1 (no positional parameters; try --help)" ;;
-		esac
-	done
-	[[ $# -eq 0 ]] || die "unexpected argument(s) after '--': $* (try --help)"
+### Configuration #####################################################
+
+init_defaults() {
+  VM_NAME="${VM_NAME:-mockvps-vbox}"
+  VM_VCPUS="${VM_VCPUS:-2}"
+  VM_MEMORY="${VM_MEMORY:-2048}"            # MiB
+  VM_DISK_SIZE_MB="${VM_DISK_SIZE_MB:-20000}"
+  VM_USER="${VM_USER:-vps}"
+  WORKDIR="${WORKDIR:-$HOME/vps}"
+  SSH_HOST_PORT="${SSH_HOST_PORT:-2222}"
+  SSH_HOST_IP="${SSH_HOST_IP:-127.0.0.1}"
+  ISO_URL="${ISO_URL:-}"
+  CDIMAGE_BASE="${CDIMAGE_BASE:-https://cdimage.debian.org/debian-cd/current/amd64/iso-cd}"
+  CD_KEY_FPRS="${CD_KEY_FPRS:-$DEFAULT_CD_KEY_FPRS}"
+  MANUAL="${MANUAL:-0}"
+  SERIAL="${SERIAL:-0}"
+  STOP_KVM="${STOP_KVM:-0}"
+  REQUIRE_SIG="${REQUIRE_SIG:-0}"
+  WEB_TUNNEL="${WEB_TUNNEL:-1}"
+  FORWARDS="${FORWARDS:-}"
+  REAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+  ASSUME_YES=0
+  EXTRA_FORWARDS=()
+  FORWARD_LIST=()
+  REINSTALL=1
+  KVM_RESTORE_HINT=""
+  ISO_FILE=""
+  ISO_LOCAL=0
+  AUTO_ISO=0
+  PRESEED_FILE=""
 }
 
-# Kernel's own module inventory -- no userspace tool racing it
+need_arg() { [[ $2 -ge 2 ]] || die "option $1 requires an argument"; }
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      -y|--yes) ASSUME_YES=1; shift ;;
+      -n|--name) need_arg "$1" $#; VM_NAME="$2"; shift 2 ;;
+      -u|--user) need_arg "$1" $#; VM_USER="$2"; shift 2 ;;
+      -p|--port) need_arg "$1" $#; SSH_HOST_PORT="$2"; shift 2 ;;
+      -c|--cpus) need_arg "$1" $#; VM_VCPUS="$2"; shift 2 ;;
+      -m|--memory) need_arg "$1" $#; VM_MEMORY="$2"; shift 2 ;;
+      -d|--disk) need_arg "$1" $#; VM_DISK_SIZE_MB="$2"; shift 2 ;;
+      -w|--workdir) need_arg "$1" $#; WORKDIR="$2"; shift 2 ;;
+      -i|--iso-url) need_arg "$1" $#; ISO_URL="$2"; shift 2 ;;
+      -f|--forward) need_arg "$1" $#; EXTRA_FORWARDS+=("$2"); shift 2 ;;
+      -k|--ip) need_arg "$1" $#; SSH_HOST_IP="$2"; shift 2 ;;
+      --cd-key-fpr) need_arg "$1" $#; CD_KEY_FPRS="$CD_KEY_FPRS $2"; shift 2 ;;
+      --manual) MANUAL=1; shift ;;
+      --serial) SERIAL=1; shift ;;
+      --stop-kvm) STOP_KVM=1; shift ;;
+      --require-signature) REQUIRE_SIG=1; shift ;;
+      --no-web-tunnel) WEB_TUNNEL=0; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try --help)" ;;
+      *) die "unexpected argument: $1 (no positional parameters; try --help)" ;;
+    esac
+  done
+  [[ $# -eq 0 ]] || die "unexpected argument(s) after '--': $* (try --help)"
+}
+
+check_forward() {
+  local lp gp
+  [[ "$1" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]] \
+    || die "invalid forward '$1' (expected LOCALPORT:GUESTPORT, e.g. 8443:443)"
+  lp="${BASH_REMATCH[1]}"; gp="${BASH_REMATCH[2]}"   # is_uint clobbers BASH_REMATCH
+  is_uint "$lp" 1024 65535 || die "forward '$1': local port must be 1024-65535"
+  is_uint "$gp" 1 65535    || die "forward '$1': guest port must be 1-65535"
+}
+
+build_forwards() {
+  local f lp seen=" " envf=()
+  FORWARD_LIST=()
+  if [[ "$WEB_TUNNEL" != "0" ]]; then FORWARD_LIST+=("8080:80"); fi
+  if [[ -n "$FORWARDS" ]]; then
+    IFS=',' read -r -a envf <<<"$FORWARDS"
+    for f in "${envf[@]}"; do FORWARD_LIST+=("$f"); done
+  fi
+  for f in ${EXTRA_FORWARDS[@]+"${EXTRA_FORWARDS[@]}"}; do FORWARD_LIST+=("$f"); done
+  for f in ${FORWARD_LIST[@]+"${FORWARD_LIST[@]}"}; do
+    check_forward "$f"
+    lp=$((10#${f%%:*}))
+    [[ "$seen" != *" $lp "* ]] || die "local port $lp is used by more than one forward"
+    seen+="$lp "
+  done
+}
+
+validate_config() {
+  [[ "$VM_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] \
+    || die "VM_NAME must be 1-64 chars [A-Za-z0-9_.-] and not start with - or . (got '$VM_NAME')"
+  [[ "$VM_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+    || die "VM_USER must be a lowercase POSIX user name (got '$VM_USER')"
+  is_uint "$SSH_HOST_PORT" 1 65535 || die "SSH_HOST_PORT must be 1-65535 (got '$SSH_HOST_PORT')"
+  is_uint "$VM_VCPUS" 1 32 || die "VM_VCPUS must be 1-32 (got '$VM_VCPUS')"
+  is_uint "$VM_MEMORY" 512 131072 || die "VM_MEMORY (MiB) must be 512-131072 (got '$VM_MEMORY')"
+  is_uint "$VM_DISK_SIZE_MB" 4000 2097152 || die "VM_DISK_SIZE_MB must be 4000-2097152 (got '$VM_DISK_SIZE_MB')"
+  [[ "$SSH_HOST_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+    || die "SSH_HOST_IP must be an IPv4 address (got '$SSH_HOST_IP')"
+  [[ "$CD_KEY_FPRS" =~ ^[0-9A-Fa-f\ ]+$ ]] || die "CD key fingerprints must be hex (got '$CD_KEY_FPRS')"
+  SSH_HOST_PORT=$((10#$SSH_HOST_PORT))
+  build_forwards
+  if [[ "$SSH_HOST_IP" != 127.* ]]; then
+    warn "NAT forward bound to $SSH_HOST_IP -- SSH will be reachable from OTHER MACHINES. Use a host firewall."
+    confirm "Proceed with a non-loopback bind?" || die "aborted by user"
+  fi
+}
+
+derive_paths() {
+  DISK="$WORKDIR/$VM_NAME.vdi"
+  CRED_DIR="$WORKDIR/credentials"
+  CRED_FILE="$CRED_DIR/$VM_NAME.env"
+  KEY_FILE="$HOME/.ssh/${VM_NAME}_id"
+  SERIAL_LOG="$WORKDIR/${VM_NAME}-serial.log"
+  SSH_BEGIN="# BEGIN mockvps-vbox:$VM_NAME (managed by mockvps-vbox.sh)"
+  SSH_END="# END mockvps-vbox:$VM_NAME"
+  SSH_LEGACY="# $VM_NAME (managed by mockvps-vbox.sh)"   # block format of the original script
+  # Hostnames cannot contain '_' or '.' labels we did not intend; keep it simple.
+  GUEST_HOST="$(printf '%s' "$VM_NAME" | LC_ALL=C tr 'A-Z_.' 'a-z--')"
+}
+
+### VirtualBox plumbing ###############################################
+
 module_loaded() { grep -q '^vboxdrv ' /proc/modules; }
 
-confirm() {
-	[[ $ASSUME_YES -eq 1 ]] && return 0
-	read -r -p "$1 [y/N] " reply
-	[[ "$reply" =~ ^[yY]([eE][sS])?$ ]]
-}
-
+# startvm/unattended need /dev/vboxdrv access (group vboxusers). Handles the
+# stale-shell case (just added to the group, not re-logged in) via sg.
 run_vbox() {
-	# startvm/unattended need /dev/vboxdrv access (group vboxusers).
-	# Handles the stale-shell case (just added to group, not re-logged in) via sg.
-	if [[ $EUID -eq 0 ]] || id -nG | grep -qw vboxusers; then
-		"$@"
-	else
-		sg vboxusers -c "$(printf '%q ' "$@")"
-	fi
+  if [[ $EUID -eq 0 ]] || id -nG | grep -qw vboxusers; then
+    "$@"
+  else
+    sg vboxusers -c "$(printf '%q ' "$@")"
+  fi
 }
+vb() { run_vbox VBoxManage "$@"; }
 
-ensure_vboxusers() {
-	log "Ensuring the vboxusers group exists and $REAL_USER is a member"
-	if ! getent group vboxusers >/dev/null; then
-		sudo groupadd vboxusers
-	fi
-	if ! id -nG "$REAL_USER" | grep -qw vboxusers; then
-		sudo usermod -aG vboxusers "$REAL_USER"
-	fi
-}
-
-fix_udev_rules() {
-	# vboxconfig regenerates 60-vboxdrv.rules with root:root 0600, locking out
-	# non-root users. Normalize to the standard Debian layout and reload the
-	# modules so udev re-applies the corrected rules to the device nodes.
-	local rule="/etc/udev/rules.d/60-vboxdrv.rules"
-	[[ -f /etc/udev/rules.d/60-vboxdrv.rules ]] || return 0
-	if ! sudo grep -q 'GROUP="vboxusers"' "$rule"; then
-		log "Normalizing /dev/vboxdrv permissions in $rule (root:root 0600 -> vboxusers 0660)"
-		sudo sed -i 's/GROUP="root"/GROUP="vboxusers"/g; s/MODE="0600"/MODE="0660"/g' "$rule"
-		sudo udevadm control --reload || true
-		# re-run udev on the live nodes without unloading anything
-		sudo udevadm trigger /sys/class/misc/vboxdrv /sys/class/misc/vboxdrvu /sys/class/misc/vboxnetctl || true
-	fi
-}
+vm_exists() { vb list vms 2>/dev/null | grep -Fq "\"$VM_NAME\""; }
 
 vm_state() {
-	VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
-		awk -F'=' '/^VMState=/ { gsub(/"/, "", $2); print $2 }'
+  vb showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
+    awk -F'=' '/^VMState=/ { gsub(/"/, "", $2); print $2 }' || true
 }
 
 wait_poweroff() {
-	for _ in $(seq 1 30); do
-		case "$(vm_state)" in
-			poweroff | aborted | "") return 0 ;;
-		esac
-		sleep 2
-	done
-	return 1
+  local i
+  for ((i = 0; i < 15; i++)); do
+    case "$(vm_state)" in poweroff | aborted | "") return 0 ;; esac
+    sleep 2
+  done
+  return 1
 }
 
-verify_vboxdrv() {
-	# /proc/modules is the kernel's own word; no userspace mismatch possible
-	for _ in $(seq 1 10); do
-		module_loaded && return 0
-		sleep 2
-	done
-	die "vboxdrv kernel module is not loaded. Try: sudo modprobe vboxdrv ; then capture: sudo dmesg | tail -30 > ~/error.log and share it."
+remove_vm() {
+  case "$(vm_state)" in
+    saved) vb discardstate "$VM_NAME" || true ;;
+    running | paused | stuck | gurumeditation)
+      vb controlvm "$VM_NAME" acpipowerbutton 2>/dev/null || true
+      wait_poweroff || vb controlvm "$VM_NAME" poweroff || true
+      wait_poweroff || true
+      ;;
+  esac
+  vb unregistervm "$VM_NAME" --delete
+}
+
+have_apt() { command -v apt-get >/dev/null 2>&1 && [[ -r /etc/os-release ]]; }
+
+install_virtualbox_apt() {
+  local codename id_like cand repo="" pkg="" c candidates=()
+  as_root apt-get update
+  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y wget gnupg ca-certificates
+
+  codename="$(. /etc/os-release; printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")"
+  id_like="$(. /etc/os-release; printf '%s %s' "${ID:-}" "${ID_LIKE:-}")"
+  if [[ -z "$codename" ]] && command -v lsb_release >/dev/null 2>&1; then
+    codename="$(lsb_release -cs 2>/dev/null || true)"
+  fi
+  [[ -n "$codename" ]] || die "Could not detect the distribution codename."
+
+  # Oracle's repo is split per codename; probe it and fall back to a close one.
+  candidates=("$codename")
+  case " $id_like " in
+    *" ubuntu "*) candidates+=(noble jammy) ;;
+    *)            candidates+=(bookworm) ;;
+  esac
+  for cand in "${candidates[@]}"; do
+    # Oracle's Release files ship 'Codename:' but no 'Suite:' line.
+    if wget -qO- --timeout=30 "https://download.virtualbox.org/virtualbox/debian/dists/$cand/Release" |
+        grep -q "^Codename: $cand$"; then
+      repo="$cand"
+      break
+    fi
+  done
+  [[ -n "$repo" ]] || die "Oracle's VirtualBox repo is unreachable or has no release for '$codename'."
+  if [[ "$repo" != "$codename" ]]; then log "Using Oracle repo branch '$repo' for codename '$codename'"; fi
+
+  wget -qO- https://www.virtualbox.org/download/oracle_vbox_2016.asc |
+    as_root gpg --dearmor --yes -o /usr/share/keyrings/oracle-virtualbox-2016.gpg
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/oracle-virtualbox-2016.gpg] https://download.virtualbox.org/virtualbox/debian $repo contrib" |
+    as_root tee /etc/apt/sources.list.d/virtualbox.list >/dev/null
+  as_root apt-get update
+
+  for c in virtualbox-7.2 virtualbox-7.1 virtualbox-7.0; do
+    cand="$(apt-cache policy "$c" 2>/dev/null | awk '/^ *Candidate:/ { print $2 }')"
+    if [[ -n "$cand" && "$cand" != "(none)" ]]; then pkg="$c"; break; fi
+  done
+  [[ -n "$pkg" ]] || die "No VirtualBox 7.x package available from Oracle's repo for this distro."
+
+  log "Installing $pkg (+ DKMS and kernel headers for the host module)"
+  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    "$pkg" dkms "linux-headers-$(uname -r)" build-essential \
+    || die "VirtualBox install failed."
+}
+
+ensure_virtualbox() {
+  local ver major
+  if ! command -v VBoxManage >/dev/null 2>&1; then
+    have_apt || die "VirtualBox is not installed, and automatic install only supports apt-based hosts.
+Install VirtualBox 7.x with your package manager (or from virtualbox.org) and re-run."
+    confirm "VirtualBox is not installed. Add Oracle's apt repository and install it (uses sudo)?" \
+      || die "VirtualBox is required; aborted."
+    install_virtualbox_apt
+  fi
+  ver="$(VBoxManage --version 2>/dev/null | head -n1 || true)"
+  major="${ver%%.*}"
+  if [[ "$major" =~ ^[0-9]+$ ]]; then
+    (( major >= 7 )) || die "VirtualBox $ver is too old; this script needs 7.0 or newer."
+  else
+    warn "Could not parse the VirtualBox version ('$ver'); continuing."
+  fi
+  log "Using VirtualBox ${ver:-unknown}"
+}
+
+ensure_vboxusers() {
+  getent group vboxusers >/dev/null || as_root groupadd vboxusers
+  if ! id -nG "$REAL_USER" | grep -qw vboxusers; then
+    log "Adding $REAL_USER to the vboxusers group"
+    as_root usermod -aG vboxusers "$REAL_USER"
+  fi
+}
+
+# vboxconfig can regenerate 60-vboxdrv.rules as root:root 0600, locking out
+# non-root users. Normalize to the standard layout.
+fix_udev_rules() {
+  local rule="/etc/udev/rules.d/60-vboxdrv.rules"
+  [[ -f "$rule" ]] || return 0
+  if ! as_root grep -q 'GROUP="vboxusers"' "$rule"; then
+    log "Normalizing /dev/vboxdrv permissions in $rule"
+    as_root sed -i 's/GROUP="root"/GROUP="vboxusers"/g; s/MODE="0600"/MODE="0660"/g' "$rule"
+    as_root udevadm control --reload || true
+    as_root udevadm trigger /sys/class/misc/vboxdrv /sys/class/misc/vboxdrvu /sys/class/misc/vboxnetctl || true
+  fi
+}
+
+ensure_vbox_host() {
+  local i
+  # Try the cheap thing first; vboxconfig stops/rebuilds modules and is only
+  # worth running when the module for this kernel is really missing.
+  if ! module_loaded; then as_root modprobe vboxdrv 2>/dev/null || true; fi
+  if ! module_loaded && [[ -x /sbin/vboxconfig ]]; then
+    log "vboxdrv is not available for $(uname -r) -- running vboxconfig (one-time build, a few minutes)"
+    as_root /sbin/vboxconfig || warn "vboxconfig exited non-zero"
+    as_root modprobe vboxdrv 2>/dev/null || true
+  fi
+  for i in 1 2 3 4 5; do
+    if module_loaded; then break; fi
+    sleep 2
+  done
+  module_loaded || die "The vboxdrv kernel module is not loaded.
+Try: sudo modprobe vboxdrv   (check 'sudo dmesg | tail -30').
+If Secure Boot is enabled, the module must be signed/enrolled (MOK) first."
+  ensure_vboxusers
+  fix_udev_rules
+}
+
+### KVM coexistence (opt-in) ##########################################
+
+kvm_loaded() { grep -q '^kvm[ _]' /proc/modules; }
+
+libvirt_running_domains() {
+  command -v virsh >/dev/null 2>&1 || return 0
+  as_root virsh --connect qemu:///system list --name 2>/dev/null | sed '/^[[:space:]]*$/d' || true
+}
+
+# Never force-kills anything: libvirt guests get an ACPI shutdown and, if they
+# do not stop, the script gives up and tells you.
+stop_kvm() {
+  local doms dom i mods
+  mods="$(awk '$1 ~ /^kvm_(intel|amd)$/ { printf "%s ", $1 }' /proc/modules)"
+  doms="$(libvirt_running_domains)"
+  if [[ -n "$doms" ]]; then
+    printf 'Running libvirt VMs that will be shut down gracefully:\n' >&2
+    printf '  %s\n' $doms >&2
+    confirm "Shut these VMs down (ACPI) and unload KVM?" || die "Aborted; nothing was changed."
+    for dom in $doms; do
+      as_root virsh --connect qemu:///system shutdown "$dom" >/dev/null 2>&1 || true
+    done
+    for ((i = 0; i < 60; i++)); do
+      if [[ -z "$(libvirt_running_domains)" ]]; then break; fi
+      sleep 2
+    done
+    [[ -z "$(libvirt_running_domains)" ]] \
+      || die "libvirt VMs are still running after 2 minutes. Not force-killing them; shut them down yourself and re-run."
+  else
+    confirm "Unload the KVM kernel modules (VirtualBox cannot share VT-x/AMD-V with KVM)?" \
+      || die "Aborted; nothing was changed."
+  fi
+  as_root systemctl stop libvirtd.service libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket 2>/dev/null || true
+  as_root modprobe -r kvm_intel 2>/dev/null || as_root modprobe -r kvm_amd 2>/dev/null || true
+  as_root modprobe -r kvm 2>/dev/null || true
+  if kvm_loaded; then
+    die "KVM modules are still in use (some process holds /dev/kvm). Close it and re-run."
+  fi
+  KVM_RESTORE_HINT="sudo modprobe ${mods:-kvm_intel} && sudo systemctl start libvirtd.socket"
+}
+
+### Credentials, keys, ISO ############################################
+
+gen_password() {
+  local pw
+  while :; do
+    pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 30)" || true
+    if [[ ${#pw} -eq 30 ]]; then printf '%s' "$pw"; return 0; fi
+  done
+}
+
+# env VM_PASSWORD > stored file > new random. Written with %q so any
+# character survives being sourced back.
+setup_credentials() {
+  mkdir -p "$WORKDIR" "$CRED_DIR"
+  chmod 700 "$CRED_DIR"
+  if [[ -n "${VM_PASSWORD:-}" ]]; then
+    log "Using VM_PASSWORD from the environment"
+  elif [[ -f "$CRED_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CRED_FILE"
+    if [[ -n "${VM_PASSWORD:-}" ]]; then
+      log "Reusing the stored password in $CRED_FILE"
+    else
+      log "Credential file has no password -- generating a new one"
+      VM_PASSWORD="$(gen_password)"
+    fi
+  else
+    log "Generating a random guest password (stored in $CRED_FILE)"
+    VM_PASSWORD="$(gen_password)"
+  fi
+  ( umask 077; printf 'VM_PASSWORD=%q\n' "$VM_PASSWORD" > "$CRED_FILE" )
+  chmod 600 "$CRED_FILE"
 }
 
 ensure_host_key() {
-	if [[ ! -f "$KEY_FILE" ]]; then
-		log "Generating dedicated SSH key for $VM_NAME: $KEY_FILE"
-		ssh-keygen -q -t ed25519 -N "" -f "$KEY_FILE" -C "$VM_USER@$VM_NAME"
-	fi
-	chmod 600 "$KEY_FILE"
-	chmod 644 "$KEY_FILE.pub"
+  mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+  if [[ ! -f "$KEY_FILE" ]]; then
+    log "Generating dedicated SSH key for $VM_NAME: $KEY_FILE"
+    ssh-keygen -q -t ed25519 -N "" -f "$KEY_FILE" -C "$VM_USER@$VM_NAME"
+  fi
+  chmod 600 "$KEY_FILE"
+  chmod 644 "$KEY_FILE.pub"
 }
 
-### Credentials #######################################################
-
-gen_password() {
-	local pw
-	while :; do
-		pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 30)" || true
-		[[ ${#pw} -eq 30 ]] && { printf '%s' "$pw"; return 0; }
-	done
+sig_problem() {
+  if [[ $REQUIRE_SIG -eq 1 ]]; then
+    die "$1 (--require-signature given)"
+  fi
+  warn "$1 -- continuing with the SHA512 checksum check only."
 }
 
-# $1 = 1 for a (re)install: env VM_PASSWORD > stored file > new random.
-#     = 0 for reusing an existing VM: only the stored file is authoritative.
-setup_credentials() {
-	local mode="$1"
-	mkdir -p "$WORKDIR" "$CRED_DIR"
-	chmod 700 "$CRED_DIR"
-	if [[ "$mode" == "1" ]]; then
-		if [[ -n "${VM_PASSWORD:-}" ]]; then
-			log "Using VM_PASSWORD from the environment"
-		elif [[ -f "$CRED_FILE" ]]; then
-			# Reuse the stored password so reinstalls stay consistent.
-			# shellcheck disable=SC1090
-			source "$CRED_FILE"
-			[[ -n "${VM_PASSWORD:-}" ]] || {
-				log "Credential file has no password -- generating a new one"
-				VM_PASSWORD="$(gen_password)"
-			}
-			log "Reusing the stored password in $CRED_FILE"
-		else
-			log "Generating a random guest password (stored in $CRED_FILE)"
-			VM_PASSWORD="$(gen_password)"
-		fi
-		printf "VM_PASSWORD='%s'\n" "$VM_PASSWORD" > "$CRED_FILE"
-		chmod 600 "$CRED_FILE"
-		unset VM_PASSWORD	# never let the plaintext linger in the environment
-	else
-		if [[ -f "$CRED_FILE" ]]; then
-			# shellcheck disable=SC1090
-			source "$CRED_FILE"
-		fi
-		[[ -n "${VM_PASSWORD:-}" ]] ||
-			die "No credential file for the existing VM ($CRED_FILE missing). Its original password is unknown; re-run with -y to reinstall."
-	fi
+# Verifies SHA512SUMS against SHA512SUMS.sign using the Debian CD signing keys.
+verify_sums_signature() {
+  local sums="$1" sig="$2" base="$3" gh fpr srv status signer allowed ok=0 got=0
+  if ! wget -q -O "$sig" --timeout=30 "$base/SHA512SUMS.sign"; then
+    sig_problem "Could not download SHA512SUMS.sign"; return 0
+  fi
+  if ! command -v gpg >/dev/null 2>&1; then
+    sig_problem "gpg is not installed, cannot check the signature"; return 0
+  fi
+  gh="$(mktemp -d)"; chmod 700 "$gh"
+  for fpr in $CD_KEY_FPRS; do
+    for srv in $CD_KEY_SERVERS; do
+      if gpg --homedir "$gh" --batch --quiet --keyserver "$srv" --recv-keys "$fpr" >/dev/null 2>&1; then
+        got=1; break
+      fi
+    done
+  done
+  if [[ $got -ne 1 ]]; then
+    rm -rf "$gh"
+    sig_problem "Could not fetch the Debian CD signing keys"; return 0
+  fi
+  if ! status="$(gpg --homedir "$gh" --batch --status-fd 1 --verify "$sig" "$sums" 2>/dev/null)"; then
+    rm -rf "$gh"
+    die "BAD or unverifiable GPG signature on SHA512SUMS -- refusing to continue."
+  fi
+  rm -rf "$gh"
+  # VALIDSIG's last field is the primary-key fingerprint.
+  signer="$(awk '$2 == "VALIDSIG" { print $NF }' <<<"$status" | head -n1)"
+  for allowed in $CD_KEY_FPRS; do
+    if [[ "${signer^^}" == "${allowed^^}" ]]; then ok=1; fi
+  done
+  [[ $ok -eq 1 ]] || die "SHA512SUMS is validly signed, but by an unexpected key ($signer).
+Check https://www.debian.org/CD/verify and, if that key is legitimate, re-run with --cd-key-fpr $signer"
+  log "GPG signature on SHA512SUMS is valid (key $signer)"
 }
 
-### NAT binding safety net ############################################
+verify_iso() {
+  local base="${ISO_URL%/*}" name vdir sums sig expected actual
+  name="$(basename "$ISO_FILE")"
+  vdir="$WORKDIR/verify"; mkdir -p "$vdir"
+  sums="$vdir/SHA512SUMS"; sig="$vdir/SHA512SUMS.sign"
+  rm -f "$sums" "$sig"
+  if ! wget -q -O "$sums" --timeout=30 "$base/SHA512SUMS"; then
+    rm -f "$sums"
+    if [[ $AUTO_ISO -eq 1 ]]; then die "Could not download $base/SHA512SUMS to verify the ISO."; fi
+    warn "No SHA512SUMS next to the ISO URL -- the ISO is NOT verified."
+    return 0
+  fi
+  expected="$(awk -v f="$name" '$2 == f { print $1 }' "$sums")"
+  if [[ -z "$expected" ]]; then
+    if [[ $AUTO_ISO -eq 1 ]]; then die "SHA512SUMS has no entry for $name."; fi
+    warn "SHA512SUMS has no entry for $name -- the ISO is NOT verified."
+    return 0
+  fi
+  verify_sums_signature "$sums" "$sig" "$base"
+  log "Verifying SHA512 of $name"
+  actual="$(sha512sum "$ISO_FILE" | awk '{ print $1 }')"
+  if [[ "$actual" != "$expected" ]]; then
+    rm -f "$ISO_FILE"
+    die "SHA512 mismatch for $name (corrupt or tampered download). The file was removed; re-run to download it again."
+  fi
+}
 
-# Ensure the SSH port-forward is bound to $SSH_HOST_IP -- live (controlvm)
-# when the VM is running, persistent (modifyvm) otherwise. Idempotent.
+ensure_iso() {
+  local listing latest
+  if [[ -n "$ISO_URL" && -f "$ISO_URL" ]]; then
+    ISO_FILE="$ISO_URL"; ISO_LOCAL=1
+    warn "Using local ISO '$ISO_FILE' -- it is NOT verified."
+    return 0
+  fi
+  if [[ -z "$ISO_URL" ]]; then
+    AUTO_ISO=1
+    listing="$(wget -qO- --timeout=30 "${CDIMAGE_BASE%/}/")" || listing=""
+    latest="$(grep -oE 'debian-[0-9]+\.[0-9]+\.[0-9]+-amd64-netinst\.iso' <<<"$listing" | sort -uV | tail -n1)" || true
+    [[ -n "$latest" ]] || die "Could not resolve the latest Debian netinst ISO. Pass -i URL or -i /path/to.iso."
+    ISO_URL="${CDIMAGE_BASE%/}/$latest"
+    log "Selected ISO: $ISO_URL"
+  fi
+  ISO_FILE="$WORKDIR/$(basename "$ISO_URL")"
+  mkdir -p "$WORKDIR"
+  if [[ ! -f "$ISO_FILE" ]]; then
+    log "Downloading $(basename "$ISO_FILE")"
+    rm -f "$ISO_FILE.part"
+    wget -c -O "$ISO_FILE.part" "$ISO_URL" || {
+      rm -f "$ISO_FILE.part"
+      die "ISO download failed. Download it manually and re-run with -i /path/to/the.iso"
+    }
+    mv "$ISO_FILE.part" "$ISO_FILE"
+  fi
+  [[ -s "$ISO_FILE" ]] || die "ISO file is empty or missing: $ISO_FILE"
+  verify_iso
+}
+
+### VM creation #######################################################
+
+port_in_use() {
+  command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :$1" 2>/dev/null | grep -q .
+}
+
+check_port_free() {
+  if port_in_use "$SSH_HOST_PORT"; then
+    die "Host port $SSH_HOST_PORT is already in use. Pick another with -p/--port."
+  fi
+}
+
+# Make sure the SSH forward matches $SSH_HOST_IP:$SSH_HOST_PORT -- live
+# (controlvm) when the VM runs, persistent (modifyvm) otherwise. Idempotent.
 ensure_nat_binding() {
-	local line cur_hostip state
-	line="$(VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
-		grep -F '="SSH,tcp,' || true)"
-	[[ -n "$line" ]] || { log "No SSH NAT forwarding rule found"; return 1; }
-	cur_hostip="$(printf '%s' "$line" | sed -E 's/.*="SSH,tcp,([^,]*),.*/\1/')"
-	[[ "$cur_hostip" == "$SSH_HOST_IP" ]] && return 0
-
-	log "Hardening SSH NAT binding: host IP '${cur_hostip:-<all interfaces>}' -> '$SSH_HOST_IP'"
-	state="$(vm_state)"
-	if [[ "$state" == "running" ]]; then
-		VBoxManage controlvm "$VM_NAME" natpf1 delete SSH 2>/dev/null || true
-		VBoxManage controlvm "$VM_NAME" natpf1 "SSH,tcp,${SSH_HOST_IP},${SSH_HOST_PORT},,22"
-	else
-		VBoxManage modifyvm "$VM_NAME" --nat-pf1 delete SSH 2>/dev/null || true
-		VBoxManage modifyvm "$VM_NAME" --nat-pf1 "SSH,tcp,${SSH_HOST_IP},${SSH_HOST_PORT},,22"
-	fi
+  local line val cur_ip="" cur_port="" want
+  want="SSH,tcp,${SSH_HOST_IP},${SSH_HOST_PORT},,22"
+  line="$(vb showvminfo "$VM_NAME" --machinereadable 2>/dev/null | grep -F '="SSH,tcp,' || true)"
+  if [[ -n "$line" ]]; then
+    val="${line#*=\"}"; val="${val%\"*}"
+    IFS=, read -r _ _ cur_ip cur_port _ <<<"$val"
+    if [[ "$cur_ip" == "$SSH_HOST_IP" && "$cur_port" == "$SSH_HOST_PORT" ]]; then return 0; fi
+    log "Updating SSH NAT rule: ${cur_ip:-<all interfaces>}:${cur_port} -> ${SSH_HOST_IP}:${SSH_HOST_PORT}"
+  else
+    log "No SSH NAT rule found -- adding ${SSH_HOST_IP}:${SSH_HOST_PORT}"
+  fi
+  if [[ "$(vm_state)" == "running" ]]; then
+    if [[ -n "$line" ]]; then vb controlvm "$VM_NAME" natpf1 delete SSH 2>/dev/null || true; fi
+    vb controlvm "$VM_NAME" natpf1 "$want"
+  else
+    if [[ -n "$line" ]]; then vb modifyvm "$VM_NAME" --nat-pf1 delete SSH 2>/dev/null || true; fi
+    vb modifyvm "$VM_NAME" --nat-pf1 "$want"
+  fi
 }
 
-# Disable a TCP serial listener inherited from older script versions
-# (fresh installs created by this script simply have none).
+# Older versions of the original script could leave a TCP serial listener on
+# all interfaces. Turn it off if we find one.
 secure_serial() {
-	local mode state
-	mode="$(VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
-		awk -F'=' '/^uartmode1=/ { gsub(/"/, "", $2); print $2 }' || true)"
-	case "$mode" in
-		*tcpserver*) ;;
-		*) return 0 ;;
-	esac
-	if [[ "$SERIAL" == "1" ]]; then
-		log "WARNING: serial TCP listener active on all interfaces (SERIAL=1). Use a host firewall, or disable it."
-		return 0
-	fi
-	state="$(vm_state)"
-	if [[ "$state" == "running" ]]; then
-		log "WARNING: serial console listener on all interfaces is still active."
-		log "         Power the VM off (VBoxManage controlvm $VM_NAME acpipowerbutton) and re-run this script to disable it."
-	else
-		log "Disabling TCP serial console listener inherited from an older install"
-		VBoxManage modifyvm "$VM_NAME" --uart1 off --uart-mode1 disconnected
-	fi
+  local mode
+  mode="$(vb showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
+    awk -F'=' '/^uartmode1=/ { gsub(/"/, "", $2); print $2 }' || true)"
+  case "$mode" in *tcpserver*) ;; *) return 0 ;; esac
+  if [[ "$(vm_state)" == "running" ]]; then
+    warn "This VM has a serial TCP listener on ALL interfaces. Power it off
+  (VBoxManage controlvm $VM_NAME acpipowerbutton) and re-run to disable it."
+  else
+    log "Disabling the TCP serial listener inherited from an older install"
+    vb modifyvm "$VM_NAME" --uart1 off --uart-mode1 disconnected
+  fi
 }
 
 create_vm() {
-	log "Creating VM: $VM_VCPUS vCPU(s), ${VM_MEMORY} MiB RAM, ${VM_DISK_SIZE_MB} MB disk"
-	mkdir -p "$WORKDIR"
+  local pf_rule="SSH,tcp,${SSH_HOST_IP},${SSH_HOST_PORT},,22"
+  log "Creating VM: $VM_VCPUS vCPU(s), ${VM_MEMORY} MiB RAM, ${VM_DISK_SIZE_MB} MB disk"
+  mkdir -p "$WORKDIR"
+  vb createvm --name "$VM_NAME" --ostype Debian_64 --register
 
-	VBoxManage createvm --name "$VM_NAME" --ostype Debian_64 --register
+  # Boot the disk first: it is empty during the install (the BIOS falls
+  # through to the ISO) and takes over automatically afterwards.
+  vb modifyvm "$VM_NAME" \
+    --cpus "$VM_VCPUS" --memory "$VM_MEMORY" --vram 16 --ioapic on \
+    --audio-driver none \
+    --boot1 disk --boot2 dvd --boot3 none --boot4 none \
+    --nic1 nat --nat-pf1 "$pf_rule"
+  if [[ "$SERIAL" == "1" ]]; then
+    # Output goes to a file; there is no network listener.
+    : > "$SERIAL_LOG"; chmod 600 "$SERIAL_LOG"
+    vb modifyvm "$VM_NAME" --uart1 0x3f8 4 --uart-mode1 file "$SERIAL_LOG"
+  fi
 
-	pf_rule="SSH,tcp,${SSH_HOST_IP},${SSH_HOST_PORT},,22"
-
-	# No TCP serial listener by default (VirtualBox cannot bind it to
-	# loopback; SERIAL=1 opt-in keeps the old all-interfaces behavior).
-	if [[ "$SERIAL" == "1" ]]; then
-		VBoxManage modifyvm "$VM_NAME" \
-			--cpus "$VM_VCPUS" \
-			--memory "$VM_MEMORY" \
-			--vram 16 \
-			--audio-driver none \
-			--boot1 dvd --boot2 disk --boot3 none --boot4 none \
-			--nic1 nat \
-			--nat-pf1 "$pf_rule" \
-			--uart1 0x3f8 4 \
-			--uart-mode1 tcpserver 4555
-		log "WARNING: serial console TCP listener enabled on ALL interfaces (VBox 7.x cannot bind it to loopback)"
-	else
-		VBoxManage modifyvm "$VM_NAME" \
-			--cpus "$VM_VCPUS" \
-			--memory "$VM_MEMORY" \
-			--vram 16 \
-			--audio-driver none \
-			--boot1 dvd --boot2 disk --boot3 none --boot4 none \
-			--nic1 nat \
-			--nat-pf1 "$pf_rule"
-	fi
-
-	VBoxManage createmedium disk --filename "$DISK" --size "$VM_DISK_SIZE_MB" --format VDI
-
-	VBoxManage storagectl "$VM_NAME" --name "IDE" --add ide --controller PIIX4 --portcount 2
-	VBoxManage storageattach "$VM_NAME" --storagectl "IDE" --port 0 --device 0 --type hdd --medium "$DISK"
+  if [[ -e "$DISK" ]]; then
+    vb closemedium disk "$DISK" --delete 2>/dev/null || rm -f "$DISK"
+  fi
+  vb createmedium disk --filename "$DISK" --size "$VM_DISK_SIZE_MB" --format VDI
+  vb storagectl "$VM_NAME" --name SATA --add sata --controller IntelAhci --portcount 2
+  vb storageattach "$VM_NAME" --storagectl SATA --port 0 --device 0 --type hdd --medium "$DISK"
+  vb storageattach "$VM_NAME" --storagectl SATA --port 1 --device 0 --type dvddrive --medium emptydrive
 }
 
+find_vbox_template() {
+  local d
+  if [[ -n "${VBOX_PRESEED_TEMPLATE:-}" && -f "$VBOX_PRESEED_TEMPLATE" ]]; then
+    printf '%s' "$VBOX_PRESEED_TEMPLATE"; return 0
+  fi
+  for d in /usr/share/virtualbox/UnattendedTemplates /usr/lib/virtualbox/UnattendedTemplates \
+           /usr/lib64/virtualbox/UnattendedTemplates /opt/VirtualBox/UnattendedTemplates; do
+    if [[ -f "$d/debian_preseed.cfg" ]]; then printf '%s' "$d/debian_preseed.cfg"; return 0; fi
+  done
+  return 1
+}
+
+# Sets PRESEED_FILE. Called directly (not via $(...)) so die() really aborts.
 build_preseed_template() {
-	local out pub64 latecmd
-	out="$WORKDIR/templates/debian_preseed.cfg"
-	mkdir -p "$(dirname "$out")"
-	chmod 700 "$(dirname "$out")"
-	[ -f /usr/share/virtualbox/UnattendedTemplates/debian_preseed.cfg ] \
-		|| die "VBox template debian_preseed.cfg not found"
-	cp /usr/share/virtualbox/UnattendedTemplates/debian_preseed.cfg "$out"
+  local out tpl pubkey kopts latecmd merged value
+  out="$WORKDIR/templates/debian_preseed.cfg"
+  mkdir -p "$(dirname "$out")"
+  chmod 700 "$(dirname "$out")"
+  tpl="$(find_vbox_template)" || die "VirtualBox's debian_preseed.cfg template was not found (set VBOX_PRESEED_TEMPLATE)."
+  cp "$tpl" "$out"
 
-	# The public key line is pure ASCII (no quotes, no backslashes), so it
-	# can be embedded directly -- no base64 applet in the installer needed.
-	pubkey="$(tr -d '\n' < "$KEY_FILE.pub")"
-	case "$pubkey" in (*[![:print:]]*) die "public key contains non-printable characters";; esac
+  # Pure ASCII, no quotes/backslashes, so it can be embedded as-is.
+  pubkey="$(tr -d '\n' < "$KEY_FILE.pub")"
+  case "$pubkey" in (*[![:print:]]*) die "public key contains non-printable characters" ;; esac
 
-	# Single-line late command: installs the pubkey, then hardens sshd to
-	# key-only login. MUST contain no backslashes or quotes so d-i's preseed
-	# parser cannot mangle it (a literal \n in the value can be turned into
-	# a real newline, splitting the command and wedging finish-install).
-	# NOTE: the final chown is numeric (1000:1000). d-i executes late_command
-	# in its own (busybox) environment, where the net name "vps" does NOT
-	# resolve -- a name-based chown silently no-ops, leaving the files owned
-	# by root, and sshd's StrictModes then refuses the key. Debian guarantees
-	# uid/gid 1000 for the first created user.
-	latecmd="mkdir -p /target/home/${VM_USER}/.ssh; echo '${pubkey}' > /target/home/${VM_USER}/.ssh/authorized_keys; chown -R 1000:1000 /target/home/${VM_USER}/.ssh; chmod 700 /target/home/${VM_USER}/.ssh; chmod 600 /target/home/${VM_USER}/.ssh/authorized_keys; mkdir -p /target/etc/ssh/sshd_config.d; echo 'PasswordAuthentication no' > /target/etc/ssh/sshd_config.d/00-mockvps-hardening.conf; echo 'PubkeyAuthentication yes' >> /target/etc/ssh/sshd_config.d/00-mockvps-hardening.conf; grep -q '^Include' /target/etc/ssh/sshd_config || echo 'PasswordAuthentication no' >> /target/etc/ssh/sshd_config; true"
+  # Single-line late command: install the pubkey, harden sshd to key-only.
+  # It must contain no backslashes or quotes d-i's preseed parser could mangle.
+  # The chown is numeric: d-i runs it in its own environment where the new
+  # user's name does not resolve (a name-based chown silently no-ops and
+  # sshd's StrictModes then rejects the key). Debian gives the first user 1000.
+  latecmd="mkdir -p /target/home/${VM_USER}/.ssh; echo '${pubkey}' > /target/home/${VM_USER}/.ssh/authorized_keys; chown -R 1000:1000 /target/home/${VM_USER}/.ssh; chmod 700 /target/home/${VM_USER}/.ssh; chmod 600 /target/home/${VM_USER}/.ssh/authorized_keys; mkdir -p /target/etc/ssh/sshd_config.d; echo 'PasswordAuthentication no' > /target/etc/ssh/sshd_config.d/00-mockvps-hardening.conf; echo 'PubkeyAuthentication yes' >> /target/etc/ssh/sshd_config.d/00-mockvps-hardening.conf; grep -q '^Include' /target/etc/ssh/sshd_config || echo 'PasswordAuthentication no' >> /target/etc/ssh/sshd_config; true"
+  [[ "$latecmd" == *\\* ]] && die "late_command contains backslashes"
+  printf '%s' "$latecmd" | sh -n || die "late_command fails sh -n parse check"
+  export AV_PUBKEY_LATECMD="$latecmd"
 
-	# Guard: the value itself must parse as a single shell command and
-	# contain nothing d-i's preseed parser could misinterpret.
-	[[ "$latecmd" == *\\* ]] && die "late_command contains backslashes"
-	printf '%s' "$latecmd" | sh -n || die "late_command fails sh -n parse check"
-	export AV_PUBKEY_LATECMD="$latecmd"
+  # Global entries (openssh-server, kernel console, no tasksel) must sit
+  # outside any @@VBOX_COND@@ block or VirtualBox's renderer strips them.
+  # Console: VGA always; also the serial port when --serial is used.
+  if [[ "$SERIAL" == "1" ]]; then kopts="console=tty0 console=ttyS0,115200n8"; else kopts="console=tty0"; fi
+  sed -i -e '/^d-i pkgsel\/include/d' -e '/^d-i debian-installer\/add-kernel-opts/d' "$out"
+  awk -v kopts="$kopts" '
+    /^d-i pkgsel\/install-language-support/ {
+      print
+      print "d-i pkgsel/include string openssh-server"
+      print "d-i debian-installer/add-kernel-opts string " kopts
+      print "d-i pkgsel/run_tasksel boolean false"
+      next
+    }
+    { print }
+  ' "$out" > "$out.new" && mv "$out.new" "$out"
+  awk '
+    /^d-i pkgsel\/install-language-support/ { zone=1; next }
+    /^@@VBOX/ { zone=0 }
+    zone && /pkgsel\/include string openssh-server/ { ok1=1 }
+    zone && /debian-installer\/add-kernel-opts string/ { ok2=1 }
+    zone && /pkgsel\/run_tasksel boolean false/ { ok3=1 }
+    END { exit !(ok1 && ok2 && ok3) }
+  ' "$out" || die "pkgsel/add-kernel/run_tasksel entries not placed outside conditionals"
 
-	# Pass A: openssh-server must be preseeded OUTSIDE any @@VBOX_COND@@
-	# block, or VBox's template renderer strips it for our flag set (no
-	# Guest Additions, non-minimal install). The stock template only lists
-	# it under conditionals, so insert a global entry right after
-	# "pkgsel/install-language-support" (always condition-free).
-	# Also pin the installer kernel console: ttyS0 (visible on the
-	# opt-in serial socket) or tty0 (VGA) by default. Remove every stock
-	# pkgsel/include / add-kernel-opts line first -- a previously hand-edited
-	# or otherwise non-pristine system template must not leak entries that
-	# the renderer may or may not strip.
-	if [[ "$SERIAL" == "1" ]]; then
-		kopts="console=ttyS0,115200n8"
-	else
-		kopts="console=tty0"
-	fi
-	sed -i \
-		-e '/^d-i pkgsel\/include/d' \
-		-e '/^d-i debian-installer\/add-kernel-opts/d' \
-		"$out"
-	# Server-only install: do NOT run tasksel at all. Debian 13 $task
-	# handling ignores a preseeded `tasksel/first multiselect standard`
-	# (installer still pulls task-desktop/task-gnome-desktop), so we skip
-	# the dialog entirely; pkgsel/include above provides openssh-server.
-	# Base system (required + important priority) is already installed by
-	# debootstrap, so the guest boots to a headless multi-user console.
-	awk -v kopts="$kopts" '
-		/^d-i pkgsel\/install-language-support/ {
-			print
-			print "d-i pkgsel/include string openssh-server"
-			print "d-i debian-installer/add-kernel-opts string " kopts
-			print "d-i pkgsel/run_tasksel boolean false"
-			next
-		}
-		{ print }
-	' "$out" > "$out.new" && mv "$out.new" "$out"
-	# Guard: all global entries must sit in the condition-free zone
-	# (between the install-language-support line and the first conditional).
-	awk '
-		/^d-i pkgsel\/install-language-support/ { zone=1; next }
-		/^@@VBOX/                                { zone=0 }
-		zone && /pkgsel\/include string openssh-server/ { ok1=1 }
-		zone && /debian-installer\/add-kernel-opts string/ { ok2=1 }
-		zone && /pkgsel\/run_tasksel boolean false/ { ok3=1 }
-		END { exit !(ok1 && ok2 && ok3) }
-	' "$out" || die "pkgsel/add-kernel/run_tasksel entries not placed outside conditionals"
+  # Merge our commands into the template's (possibly backslash-continued)
+  # late_command, keeping VirtualBox's own post-install step.
+  if grep -q '^d-i preseed/late_command' "$out"; then
+    awk '
+      /^d-i preseed\/late_command/ {
+        val = $0
+        sub(/^d-i preseed\/late_command string[ \t]*/, "", val)
+        sub(/\\[ \t]*$/, "", val)
+        while ((getline nxt) > 0) {
+          cont = (nxt ~ /\\[ \t]*$/)
+          sub(/\\[ \t]*$/, "", nxt)
+          val = val " " nxt
+          if (!cont) break
+        }
+        print "d-i preseed/late_command string " val " ; " ENVIRON["AV_PUBKEY_LATECMD"]
+        next
+      }
+      { print }
+    ' "$out" > "$out.new" && mv "$out.new" "$out"
+  else
+    printf 'd-i preseed/late_command string %s\n' "$latecmd" >> "$out"
+  fi
+  grep -q 'preseed/late_command' "$out" || die "late_command insertion into preseed failed"
+  awk '/^d-i preseed\/late_command/ && found++ { exit 1 }' "$out" \
+    || die "multiple preseed/late_command entries in preseed"
 
-	# Pass B: merge the target-side commands into the template's existing
-	# (possibly backslash-continued) preseed/late_command entry; create one
-	# if the template has none. The stock vboxpostinstall step is preserved.
-	if grep -q '^d-i preseed/late_command' "$out"; then
-		awk '
-			/^d-i preseed\/late_command/ {
-				val = $0
-				sub(/^d-i preseed\/late_command string[ \t]*/, "", val)
-				sub(/\\[ \t]*$/, "", val)
-				while ((getline nxt) > 0) {
-					cont = (nxt ~ /\\[ \t]*$/)
-					sub(/\\[ \t]*$/, "", nxt)
-					val = val " " nxt
-					if (!cont) break
-				}
-				print "d-i preseed/late_command string " val " ; " ENVIRON["AV_PUBKEY_LATECMD"]
-				next
-			}
-			{ print }
-		' "$out" > "$out.new" && mv "$out.new" "$out"
-	else
-		printf 'd-i preseed/late_command string %s\n' "$latecmd" >> "$out"
-	fi
+  merged="$(grep -E '^d-i preseed/late_command' "$out")"
+  [[ "$merged" == *"$latecmd"* ]] || die "injected late_command not found in merged template"
+  value="${merged#d-i preseed/late_command string }"
+  [[ "$value" != "$merged" ]] || die "malformed late_command line in preseed"
+  [[ "$value" == *\\* ]] && die "merged late_command contains backslashes"
+  value="${value%; true}; true"
+  printf '%s' "$value" | sh -n || die "merged late_command fails sh -n parse check"
 
-	grep -q 'preseed/late_command' "$out" || die "late_command insertion into preseed failed"
-	awk '/^d-i preseed\/late_command/ && found++ { exit 1 }' "$out" \
-		|| die "multiple preseed/late_command entries in preseed"
-
-	# Post-merge guard: exactly one line must carry the merged value, it must
-	# embed our injected chain verbatim, and the value must sh-parse cleanly
-	# with no d-i-ambiguous escapes.
-	merged="$(grep -E '^d-i preseed/late_command' "$out")"
-	[[ "$merged" == *"$latecmd"* ]] || die "injected late_command not found in merged template"
-	value="${merged#d-i preseed/late_command string }"
-	[[ "$value" != "$merged" ]] || die "malformed late_command line in preseed"
-	[[ "$value" == *\\* ]] && die "merged late_command contains backslashes"
-	value="${value%; true}; true"
-	printf '%s' "$value" | sh -n || die "merged late_command fails sh -n parse check"
-
-	chmod 600 "$out"
-	echo "$out"
+  chmod 600 "$out"
+  PRESEED_FILE="$out"
 }
 
+### SSH config ########################################################
+
+# Writes (or replaces) this VM's managed block in ~/.ssh/config. Each VM gets
+# its own BEGIN/END-delimited block, so several VMs (-n) never clobber each
+# other. A backup is kept in ~/.ssh/config.mockvps.bak.
 write_ssh_block() {
-	local blockfile blockout
-	mkdir -p "$HOME/.ssh"
-	chmod 700 "$HOME/.ssh"
-	touch "$HOME/.ssh/config"
-	chmod 600 "$HOME/.ssh/config"
+  local cfg="$HOME/.ssh/config" blockfile out f
+  mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+  touch "$cfg"; chmod 600 "$cfg"
+  if grep -qxF "$SSH_BEGIN" "$cfg" && ! grep -qxF "$SSH_END" "$cfg"; then
+    die "$cfg has a '$SSH_BEGIN' line but no matching END line; fix it by hand and re-run."
+  fi
+  cp -p "$cfg" "$cfg.mockvps.bak"
 
-	blockfile="$(mktemp)"
-	chmod 600 "$blockfile"
-	{
-		echo "# $SSH_MARKER_FILE"
-		echo "Host $VM_NAME"
-		echo "    HostName $SSH_HOST_IP"
-		echo "    Port $SSH_HOST_PORT"
-		echo "    User $VM_USER"
-		echo "    IdentityFile $KEY_FILE"
-		echo "    IdentitiesOnly yes"
-		if [[ "${WEB_TUNNEL:-1}" != "0" ]]; then
-			# Tunnel the guest web server (e.g. Apache) into the host loopback
-			echo "    LocalForward 8080 localhost:80"
-		fi
-	} > "$blockfile"
+  blockfile="$(mktemp)"; out="$(mktemp)"
+  chmod 600 "$blockfile" "$out"
+  {
+    echo "$SSH_BEGIN"
+    echo "Host $VM_NAME"
+    echo "  HostName $SSH_HOST_IP"
+    echo "  Port $SSH_HOST_PORT"
+    echo "  User $VM_USER"
+    echo "  IdentityFile $KEY_FILE"
+    echo "  IdentitiesOnly yes"
+    echo "  HostKeyAlias $VM_NAME"
+    echo "  StrictHostKeyChecking accept-new"
+    for f in ${FORWARD_LIST[@]+"${FORWARD_LIST[@]}"}; do
+      echo "  LocalForward ${f%%:*} localhost:${f##*:}"
+    done
+    echo "$SSH_END"
+  } > "$blockfile"
 
-	# Replace an existing managed block in place (preserves position and
-	# avoids duplicate Host entries); otherwise append it at the end.
-	# The old managed block's own "Host $VM_NAME" line must not be mistaken
-	# for the boundary to the next foreign Host block.
-	blockout="$(mktemp)"
-	chmod 600 "$blockout"
-	awk -v bf="$blockfile" -v vm="$VM_NAME" '
-		$0 ~ /managed by mockvps-vbox\.sh/ {
-			while ((getline line < bf) > 0) print line
-			close(bf)
-			dropped = 1
-			next
-		}
-		dropped && $0 ~ /^Host[[:space:]]/ && $0 != "Host " vm { dropped = 0 }
-		dropped { next }
-		{ print }
-	' "$HOME/.ssh/config" > "$blockout" || { rm -f "$blockfile" "$blockout"; die "ssh config block replacement failed"; }
-	mv "$blockout" "$HOME/.ssh/config"
-	if ! grep -qF "$SSH_MARKER_FILE" "$HOME/.ssh/config"; then
-		cat "$blockfile" >> "$HOME/.ssh/config"
-	fi
-	chmod 600 "$HOME/.ssh/config"
-	rm -f "$blockfile"
+  awk -v bf="$blockfile" -v begin="$SSH_BEGIN" -v end="$SSH_END" \
+      -v legacy="$SSH_LEGACY" -v host="Host $VM_NAME" '
+    $0 == begin  { while ((getline l < bf) > 0) print l; close(bf); placed = 1; skip = 1; next }
+    skip         { if ($0 == end) skip = 0; next }
+    $0 == legacy { lg = 1; next }
+    lg           { if ($0 == host || $0 ~ /^[ \t]/) next; lg = 0 }
+    { print }
+    END { if (!placed) { if (NR > 0) print ""; while ((getline l < bf) > 0) print l } }
+  ' "$cfg" > "$out" || { rm -f "$blockfile" "$out"; die "ssh config block replacement failed"; }
+  cat "$out" > "$cfg"     # keep the inode, so a symlinked config still works
+  rm -f "$blockfile" "$out"
 }
 
-# Test hook: lets test harnesses source helper functions without running.
-[[ "${MOCKVPS_TEST:-}" == "1" ]] && return 0 2>/dev/null || true
+forget_old_host_keys() {
+  ssh-keygen -R "$VM_NAME" >/dev/null 2>&1 || true
+  ssh-keygen -R "[$SSH_HOST_IP]:$SSH_HOST_PORT" >/dev/null 2>&1 || true
+}
 
-### -i. CLI + validation ###############################################
+ssh_banner_ready() {
+  timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"; read -t 3 -r line <&3 2>/dev/null; [[ $line == SSH-* ]]' _ "$SSH_HOST_IP" "$SSH_HOST_PORT" 2>/dev/null
+}
 
-ASSUME_YES=0
-parse_args "$@"
+probe_key_login() {
+  ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 \
+      -o StrictHostKeyChecking=accept-new -o HostKeyAlias="$VM_NAME" \
+      -o IdentitiesOnly=yes -i "$KEY_FILE" \
+      -p "$SSH_HOST_PORT" "$VM_USER@$SSH_HOST_IP" true 2>/dev/null
+}
 
-# Recompute what depends on the (possibly flag-overridden) identity vars
-DISK="${WORKDIR}/${VM_NAME}.vdi"
-CRED_DIR="${WORKDIR}/credentials"
-CRED_FILE="${CRED_DIR}/${VM_NAME}.env"
-KEY_FILE="${HOME}/.ssh/${VM_NAME}_id"
-SSH_MARKER_FILE="${VM_NAME} (managed by mockvps-vbox.sh)"
+start_vm() {
+  local frontend="$1" out
+  if out="$(vb startvm "$VM_NAME" --type "$frontend" 2>&1)"; then return 0; fi
+  printf '%s\n' "$out" >&2
+  if grep -qiE 'VERR_VMX_IN_VMX_ROOT_MODE|VERR_SVM_IN_USE|kvm' <<<"$out"; then
+    die "VirtualBox cannot start while KVM is loaded. Re-run with --stop-kvm
+(libvirt VMs are shut down gracefully, never force-killed)."
+  fi
+  die "Could not start the VM '$VM_NAME'."
+}
 
-# env-var paths skipped flag validation, so re-validate everything here
-is_uint "${SSH_HOST_PORT}" 1 65535       || die "SSH_HOST_PORT must be 1-65535 (got '$SSH_HOST_PORT')"
-is_uint "${VM_VCPUS}" 1 32               || die "VM_VCPUS must be 1-32 (got '$VM_VCPUS')"
-is_uint "${VM_MEMORY}" 512 131072        || die "VM_MEMORY (MiB) must be 512-131072 (got '$VM_MEMORY')"
-is_uint "${VM_DISK_SIZE_MB}" 4000 2097152 || die "VM_DISK_SIZE_MB must be 4000-2097152 (got '$VM_DISK_SIZE_MB')"
-[[ "$VM_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "VM_USER must be a lowercase POSIX user name (got '$VM_USER')"
-[[ "$VM_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "VM_NAME must be 1-64 chars [A-Za-z0-9_.-], not starting with - . (got '$VM_NAME')"
+wait_for_ssh() {
+  local i state
+  log "Waiting for SSH on $SSH_HOST_IP:$SSH_HOST_PORT (up to 30 minutes)"
+  for ((i = 0; i < 180; i++)); do
+    state="$(vm_state)"
+    case "$state" in
+      poweroff | aborted)
+        return 2 ;;
+    esac
+    if ssh_banner_ready; then return 0; fi
+    sleep 10
+  done
+  return 1
+}
 
-if [[ "$SSH_HOST_IP" != 127.0.0.1 ]]; then
-	if ! [[ "$SSH_HOST_IP" =~ ^127\. ]]; then
-		printf 'WARNING: NAT forward bound to %s -- SSH and the lab will be reachable from OTHER MACHINES.\nSet a host firewall before running.\n' "$SSH_HOST_IP" >&2
-		confirm "Proceed with a non-loopback bind?" || die "aborted by user"
-	fi
-fi
+### Main ##############################################################
 
-# Port conflict preflight: VirtualBox forwards need the port after the VM
-# boots; die early with a clear message instead of confusing TCP turmoils.
-if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :$SSH_HOST_PORT" 2>/dev/null | grep -q .; then
-	die "host port $SSH_HOST_PORT is already LISTENing locally. Pick another port (-p/--port or SSH_HOST_PORT)."
-fi
-
-### 0. sudo warmup #####################################################
-
-[[ $EUID -eq 0 ]] || sudo -v || die "sudo access required."
-
-### 1. Install VirtualBox #############################################
-
-log "Installing VirtualBox from the official Oracle repository"
-
-sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wget gnupg ca-certificates
-
-source /etc/os-release
-CODENAME="${VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null || true)}"
-[[ -n "$CODENAME" ]] || die "Could not detect Debian codename."
-
-# Oracle's repo splits per codename; probe it and fall back to bookworm
-# (older packages still install fine on newer Debian).
-REPO_CODENAME=""
-for cand in "$CODENAME" "bookworm"; do
-	# Oracle's Release files ship 'Codename:' but no 'Suite:' line, so probe Codename
-	if wget -qO- --timeout=30 "https://download.virtualbox.org/virtualbox/debian/dists/$cand/Release" | grep -q "^Codename: $cand$"; then
-		REPO_CODENAME="$cand"
-		break
-	fi
-done
-[[ -n "$REPO_CODENAME" ]] || die "Oracle VirtualBox repo is unreachable or has no release for this distro."
-[[ "$REPO_CODENAME" != "$CODENAME" ]] && log "Using repo branch '$REPO_CODENAME' for codename '$CODENAME'"
-
-wget -qO- https://www.virtualbox.org/download/oracle_vbox_2016.asc |
-	sudo gpg --dearmor --yes -o /usr/share/keyrings/oracle-virtualbox-2016.gpg
-
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/oracle-virtualbox-2016.gpg] https://download.virtualbox.org/virtualbox/debian $REPO_CODENAME contrib" |
-	sudo tee /etc/apt/sources.list.d/virtualbox.list >/dev/null
-
-sudo apt-get update
-
-VB_PKG=""
-for candidate in virtualbox-7.2 virtualbox-7.1 virtualbox-7.0 virtualbox; do
-	cand="$(apt-cache policy "$candidate" 2>/dev/null | awk '/^ *Candidate:/ { print $2 }')"
-	if [[ -n "$cand" && "$cand" != "(none)" ]]; then
-		VB_PKG="$candidate"
-		break
-	fi
-done
-[[ -n "$VB_PKG" ]] || die "No VirtualBox package available for this distro."
-
-log "Installing $VB_PKG (+ DKMS and kernel headers for the host module)"
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-	"$VB_PKG" dkms "linux-headers-$(uname -r)" build-essential ||
-	die "VirtualBox install failed."
-
-log "Checking the VirtualBox host kernel module"
-# NOTE: do NOT run vboxconfig on every invocation -- its `setup` stops
-# (unloads) + rebuilds + "cleans" the module tree, and its start() decides
-# "already running" from the leftover /dev node, not the kernel. On this
-# machine it repeatedly left the module unloaded. Modules built by an
-# earlier DKMS/vboxconfig run persist in /lib/modules; just modprobe them.
-if [[ ! -e "/lib/modules/$(uname -r)/misc/vboxdrv.ko" ]]; then
-	log "No prebuilt modules for $(uname -r) -- running vboxconfig (one-time build, a few minutes)"
-	sudo /sbin/vboxconfig || log "vboxconfig exited nonzero -- init load attempt will tell us"
-	ensure_vboxusers	# keep rule regeneration pairing with group permission
-	sudo /usr/lib/virtualbox/vboxdrv.sh start || true
-else
-	log "Prebuilt vboxdrv modules present"
-fi
-
-if ! module_loaded; then
-	log "Loading vboxdrv via modprobe"
-	sudo modprobe vboxdrv || die "modprobe vboxdrv failed. Capture evidence with: sudo dmesg | tail -30 > ~/error.log and share it."
-fi
-for m in vboxnetflt vboxnetadp; do
-	grep -q "^$m " /proc/modules || sudo modprobe "$m" || true
-done
-
-verify_vboxdrv
-fix_udev_rules
-
-VBoxManage --version
-
-ensure_vboxusers
-
-### 2. (Re)create the VM ##############################################
-
-log "Preparing VM '$VM_NAME'"
-REINSTALL=1	# fresh install unless an existing VM is being reused
-
-if VBoxManage list vms 2>/dev/null | grep -Fq "\"$VM_NAME\""; then
-	state="$(vm_state)"
-	log "VM already exists, state: ${state:-unknown}"
-	if [[ $ASSUME_YES -eq 1 ]]; then
-		log "-y given: deleting the existing VM and reinstalling"
-	else
-		confirm "Delete the existing VM and reinstall?" &&
-			log "Deleting existing VM" ||
-			{ log "Reusing existing VM (will resume and wait for SSH)"; REINSTALL=0; }
-	fi
-
-	if [[ $REINSTALL -eq 1 ]]; then
-		if [[ "$state" == "running" || "$state" == "saved" || "$state" == "gurumeditation" ]]; then
-			run_vbox VBoxManage controlvm "$VM_NAME" acpipowerbutton 2>/dev/null ||
-				run_vbox VBoxManage controlvm "$VM_NAME" poweroff 2>/dev/null || true
-			wait_poweroff || run_vbox VBoxManage controlvm "$VM_NAME" poweroff || true
-		fi
-		run_vbox VBoxManage unregistervm "$VM_NAME" --delete
-	fi
-fi
-
-if [[ $REINSTALL -eq 1 ]]; then
-	create_vm
-else
-	log "Existing VM kept; verifying secure bindings"
-fi
-
-# Hardening safety net for both fresh and reused VMs
-ensure_nat_binding || true
-secure_serial
-
-### 3. SSH key + ISO###################################################
-
-ensure_host_key
-
-ISO_FILE=""
-if [[ -n "$ISO_URL" ]]; then
-	ISO_FILE="$WORKDIR/$(basename "$ISO_URL")"
-fi
-
-log "Downloading installer ISO (skipped if it already exists)"
-if [[ -z "$ISO_FILE" ]]; then
-	latest="$(wget -qO- --timeout=30 "$CDIMAGE_BASE/" |
-		grep -oE 'debian-[0-9]+\.[0-9]+\.[0-9]+-amd64-netinst\.iso' |
-		sort -uV | tail -n1)" || true
-	[[ -n "$latest" ]] || die "Could not resolve the latest ISO. Set ISO_URL='/path/to.iso' or a full direct URL and re-run."
-	ISO_URL="${CDIMAGE_BASE%/}/$latest"
-	ISO_FILE="$WORKDIR/$latest"
-	log "Selected ISO: $ISO_URL"
-fi
-
-if [[ ! -f "$ISO_FILE" ]]; then
-	rm -f "$ISO_FILE.part"
-	wget -c -O "$ISO_FILE.part" "$ISO_URL" || {
-		rm -f "$ISO_FILE.part"
-		die "ISO download failed. You may download it manually and re-run with ISO_URL=/path/to/the.iso"
-	}
-	mv "$ISO_FILE.part" "$ISO_FILE"
-fi
-[[ -s "$ISO_FILE" ]] || die "ISO file is empty or missing: $ISO_FILE"
-
-### 4. Run the install #################################################
-
-# VirtualBox cannot share VT-x with the KVM hypervisor (VERR_VMX_IN_VMX_ROOT_MODE).
-# Stop the earlier KVM setup (libvirtd + any KVM VMs) and unload the kvm modules.
-if grep -q '^kvm[ _-]' /proc/modules; then
-	log "KVM hypervisor is loaded -- stopping libvirtd/KVM VMs and unloading KVM"
-	sudo systemctl stop libvirtd.service libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket 2>/dev/null || true
-	for kvm_vm in $(sudo virsh --connect qemu:///system list --name 2>/dev/null); do
-		[[ -n "$kvm_vm" ]] && sudo virsh --connect qemu:///system destroy "$kvm_vm" 2>/dev/null || true
-	done
-	sudo modprobe -r kvm_intel 2>/dev/null || sudo modprobe -r kvm_amd 2>/dev/null || true
-	sudo modprobe -r kvm 2>/dev/null || true
-fi
-if grep -q '^kvm[ _-]' /proc/modules; then
-	die "KVM is still running and VirtualBox needs VT-x exclusively. Free it with:
-  sudo systemctl stop libvirtd; sudo virsh --connect qemu:///system destroy <vm>; sudo modprobe -r kvm_intel kvm"
-fi
-
-# The module can get churned by a concurrent `sudo /sbin/vboxconfig` run
-# (do NOT run that while this script executes). Recheck right before booting:
-if ! module_loaded; then
-	log "vboxdrv dropped mid-run -- reloading once"
-	sudo modprobe vboxdrv
-fi
-verify_vboxdrv
-
-if [[ "$MANUAL" != "1" && $REINSTALL -eq 1 ]]; then
-	setup_credentials 1
-	log "Running unattended Debian install (takes ~10-20 minutes)"
-
-	# Password handed over via a 0600 file, never via the command line
-	# (keeps it out of shell history and process lists).
-	pwfile="$CRED_DIR/${VM_NAME}.pwfile"
-	oldumask="$(umask)"
-	umask 077
-	# shellcheck disable=SC1090
-	source "$CRED_FILE"
-	printf '%s\n' "$VM_PASSWORD" > "$pwfile"
-	unset VM_PASSWORD
-	umask "$oldumask"
-
-	if ! run_vbox VBoxManage unattended install "$VM_NAME" \
-		--iso "$ISO_FILE" \
-		--script-template "$(build_preseed_template)" \
-		--user "$VM_USER" \
-		--user-password-file "$pwfile" \
-		--hostname "${VM_NAME}.debian.local" \
-		--time-zone UTC \
-		--locale en_US \
-		--country US; then
-		rm -f "$pwfile"
-		die "The full unattended flag set was rejected. Run 'MANUAL=1 $0' for the interactive installer instead."
-	fi
-	rm -f "$pwfile"
-elif [[ "$MANUAL" == "1" && $REINSTALL -eq 1 ]]; then
-	log "MANUAL=1: attaching the ISO and booting the interactive installer"
-	log "NOTE: the interactive installer does NOT inject the SSH key; add it yourself afterwards."
-	run_vbox VBoxManage storageattach "$VM_NAME" --storagectl "IDE" --port 1 --device 0 --type dvddrive --medium "$ISO_FILE"
-fi
-
-state="$(vm_state)"
-[[ "$state" == "running" ]] || run_vbox VBoxManage startvm "$VM_NAME" --type headless
-
-### 5. Wait for SSH ####################################################
-
-log "Waiting for SSH on $SSH_HOST_IP:$SSH_HOST_PORT (up to 30 minutes)"
-ok=0
-for _ in $(seq 1 180); do
-	# bail out early if the VM turned off unexpectedly during install
-	state="$(vm_state)"
-	if [[ -n "$state" && "$state" != "running" && "$state" != "gurumeditation" ]]; then
-		if [[ "$MANUAL" != "1" && "$state" == "poweroff" ]]; then
-			# unattended installs typically finish with a running VM; if it
-			# powered off, the install likely failed -> tell the user
-			break
-		fi
-	fi
-	if (timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$SSH_HOST_PORT; read -t 3 -r line <&3 2>/dev/null; [[ \$line == SSH-* ]]") 2>/dev/null; then
-		ok=1
-		break
-	fi
-	sleep 10
-done
-
-if [[ $ok -ne 1 ]]; then
-	log "SSH is not reachable yet."
-	cat <<EOF
-If you used MANUAL=1, finish the Debian installer (openssh-server option)
-in the GUI console:
-    VBoxManage startvm "$VM_NAME" --type gui
-Then detach the ISO afterwards:
-    VBoxManage storageattach "$VM_NAME" --storagectl IDE --port 1 --device 0 \\
-        --type dvddrive --medium emptydrive
-Rerun this script to wait for SSH, or just try: ssh -p $SSH_HOST_PORT $VM_USER@$SSH_HOST_IP
-EOF
-	exit 0
-fi
-
-### 6. SSH config snippet ##############################################
-
-write_ssh_block
-
-### 7. Verify key auth #################################################
-
-if [[ "$MANUAL" != "1" ]]; then
-	log "Probing key-based login into the guest"
-	if ssh -o BatchMode=yes \
-		-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-		-o IdentitiesOnly=yes -i "$KEY_FILE" \
-		-p "$SSH_HOST_PORT" "$VM_USER@127.0.0.1" true 2>/dev/null; then
-		log "Key-based SSH works; guest password auth for SSH is disabled."
-	else
-		log "NOTE: key login not confirmed yet (first boot may still be finishing)."
-		if [[ "$REINSTALL" == "0" ]]; then
-			log "      Existing VM may predate key injection; log in once with the stored password, then: sudo systemctl restart ssh"
-		fi
-	fi
-fi
-
-### 8. Summary #########################################################
-
-cat <<EOF
+print_summary() {
+  local f
+  cat <<EOF
 
 VM is ready.
 
 Connect:
-    ssh $VM_NAME                    # dedicated key; IdentitiesOnly
-    (or) ssh -p $SSH_HOST_PORT $VM_USER@127.0.0.1
+  ssh $VM_NAME                    # dedicated key, key-only login
+  (or) ssh -p $SSH_HOST_PORT $VM_USER@$SSH_HOST_IP
 
 Install Apache in the guest (sudo asks for the stored password):
-    ssh $VM_NAME
-    sudo apt-get update && sudo apt-get install -y apache2
+  ssh $VM_NAME
+  sudo apt-get update && sudo apt-get install -y apache2
 
-Forgot the password? Read it from the credential store (SSH login itself
-is key-only and never needs it):
-    cat $CRED_FILE   # file is mode 0600, owned by $REAL_USER
+Forgot the password? (SSH never needs it)
+  cat $CRED_FILE
 
-Browse the guest's website from the host's Firefox via the SSH tunnel
-(any \`ssh $VM_NAME\` session activates the forward):
-    http://localhost:8080
+SSH tunnels (active while an 'ssh $VM_NAME' session is open):
+EOF
+  if [[ ${#FORWARD_LIST[@]} -eq 0 ]]; then
+    echo "  (none)"
+  else
+    for f in "${FORWARD_LIST[@]}"; do
+      echo "  http://localhost:${f%%:*}  ->  guest port ${f##*:}"
+    done
+  fi
+  cat <<EOF
 
 Management ($VM_NAME):
-    run headless        : VBoxManage startvm "$VM_NAME" --type headless
-    GUI console         : VBoxManage startvm "$VM_NAME" --type gui
-    graceful power off  : VBoxManage controlvm "$VM_NAME" acpipowerbutton
-    hard power off      : VBoxManage controlvm "$VM_NAME" poweroff
-    show VM status      : VBoxManage list runningvms
-    snapshot clean state: VBoxManage snapshot "$VM_NAME" take clean
-    restore snapshot    : VBoxManage snapshot "$VM_NAME" restore clean
-
-Guest console fallback password: $CRED_FILE (mode 0600)
+  run headless      : VBoxManage startvm "$VM_NAME" --type headless
+  GUI console       : VBoxManage startvm "$VM_NAME" --type gui
+  graceful power off: VBoxManage controlvm "$VM_NAME" acpipowerbutton
+  hard power off    : VBoxManage controlvm "$VM_NAME" poweroff
+  VM status         : VBoxManage list runningvms
+  snapshot clean    : VBoxManage snapshot "$VM_NAME" take clean
+  restore snapshot  : VBoxManage snapshot "$VM_NAME" restore clean
 EOF
+  if [[ "$SERIAL" == "1" ]]; then echo "  serial log        : $SERIAL_LOG"; fi
+  if [[ -n "$KVM_RESTORE_HINT" ]]; then
+    printf '\nKVM was unloaded for VirtualBox. To bring it back later:\n  %s\n' "$KVM_RESTORE_HINT"
+  fi
+}
+
+main() {
+  local rc state
+  init_defaults
+  parse_args "$@"
+  validate_config
+  derive_paths
+
+  [[ "$(uname -s)" == "Linux" ]] || die "This script supports Linux hosts only."
+  [[ "$(uname -m)" == "x86_64" ]] || die "This script supports x86_64 hosts only (on ARM look at Lima or multipass)."
+  if [[ $EUID -ne 0 ]]; then sudo -v || die "sudo access required."; fi
+
+  ensure_virtualbox
+  ensure_vbox_host
+
+  # KVM is only ever touched when you ask for it.
+  if kvm_loaded; then
+    if [[ $STOP_KVM -eq 1 ]]; then
+      stop_kvm
+    else
+      warn "KVM is loaded. VirtualBox may refuse to start VMs until it is unloaded; if so, re-run with --stop-kvm."
+    fi
+  fi
+
+  log "Preparing VM '$VM_NAME'"
+  if vm_exists; then
+    state="$(vm_state)"
+    log "VM already exists (state: ${state:-unknown})"
+    if confirm "Delete the existing VM and reinstall?"; then
+      remove_vm
+    else
+      log "Reusing the existing VM"
+      REINSTALL=0
+    fi
+  fi
+
+  if [[ $REINSTALL -eq 1 ]]; then
+    check_port_free
+    create_vm
+  else
+    ensure_nat_binding
+    if [[ "$(vm_state)" != "running" ]]; then check_port_free; fi
+  fi
+  secure_serial
+
+  ensure_host_key
+
+  if [[ $REINSTALL -eq 1 ]]; then
+    ensure_iso
+    forget_old_host_keys
+    if [[ "$MANUAL" == "1" ]]; then
+      vb storageattach "$VM_NAME" --storagectl SATA --port 1 --device 0 --type dvddrive --medium "$ISO_FILE"
+      write_ssh_block
+      start_vm gui
+      cat <<EOF
+
+Interactive installer started in a GUI window. In it, create the user '$VM_USER'
+and select "SSH server" in the software selection. Afterwards, install your key:
+
+  ssh-copy-id -i "$KEY_FILE.pub" -p $SSH_HOST_PORT $VM_USER@$SSH_HOST_IP
+
+then:  ssh $VM_NAME
+EOF
+      return 0
+    fi
+
+    setup_credentials
+    build_preseed_template
+    local pwfile="$CRED_DIR/${VM_NAME}.pwfile"
+    # shellcheck disable=SC1090
+    ( umask 077; source "$CRED_FILE"; printf '%s\n' "$VM_PASSWORD" > "$pwfile" )
+    log "Running unattended Debian install (typically 10-20 minutes)"
+    if ! vb unattended install "$VM_NAME" \
+          --iso "$ISO_FILE" \
+          --script-template "$PRESEED_FILE" \
+          --user "$VM_USER" \
+          --user-password-file "$pwfile" \
+          --hostname "${GUEST_HOST}.debian.local" \
+          --time-zone UTC --locale en_US --country US; then
+      rm -f "$pwfile"
+      die "VirtualBox rejected the unattended-install options. Try --manual for the interactive installer."
+    fi
+    rm -f "$pwfile"
+  fi
+
+  if [[ "$(vm_state)" != "running" ]]; then start_vm headless; fi
+
+  set +e
+  wait_for_ssh; rc=$?
+  set -e
+  case $rc in
+    0) ;;
+    2) printf 'ERROR: the VM powered off before SSH came up -- the install most likely failed.\n' >&2
+       printf '  Inspect it with: VBoxManage startvm "%s" --type gui\n' "$VM_NAME" >&2
+       printf '  (add --serial on a new run to capture installer output in a log file)\n' >&2
+       exit 2 ;;
+    *) printf 'ERROR: SSH did not come up on %s:%s within 30 minutes.\n' "$SSH_HOST_IP" "$SSH_HOST_PORT" >&2
+       printf '  The install may still be running. Check with: VBoxManage startvm "%s" --type gui\n' "$VM_NAME" >&2
+       printf '  If it finished, re-run this script and answer N to reuse the VM.\n' >&2
+       exit 2 ;;
+  esac
+
+  write_ssh_block
+
+  log "Probing key-based login into the guest"
+  local tries=0
+  until probe_key_login; do
+    tries=$((tries + 1))
+    if [[ $tries -ge 6 ]]; then
+      printf 'ERROR: SSH is up but key login failed.\n' >&2
+      if [[ $REINSTALL -eq 0 ]]; then
+        printf '  The reused VM may predate key injection. Log in once with the stored password\n' >&2
+        printf '  (%s) and add %s.pub to ~/.ssh/authorized_keys.\n' "$CRED_FILE" "$KEY_FILE" >&2
+      else
+        printf '  See "Key-only login refused" in the README troubleshooting section.\n' >&2
+      fi
+      exit 3
+    fi
+    sleep 5
+  done
+  log "Key-based SSH works; password authentication over SSH is disabled in the guest."
+
+  print_summary
+}
+
+# Allow `source mockvps-vbox.sh` (e.g. from tests) without running anything.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
