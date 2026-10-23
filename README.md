@@ -48,6 +48,12 @@ Serve a website, in the guest:
 sudo apt-get update && sudo apt-get install -y apache2
 ```
 
+When `sudo` asks for a password, use the guest password the script
+generated for you: it is stored in `~/vps/credentials/mockvps-vbox.env`
+(mode 0600, readable only by you; use `~/vps/credentials/<name>.env` if you
+renamed the VM with `-n`). SSH itself never needs that password -- remote
+login is key-only.
+
 ...then open `http://localhost:8080` in your host browser while an
 `ssh mockvps-vbox` session is running. The SSH config block the script
 writes includes a `LocalForward 8080 localhost:80`.
