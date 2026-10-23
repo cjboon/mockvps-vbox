@@ -822,6 +822,10 @@ Install Apache in the guest (sudo asks for the stored password):
     ssh $VM_NAME
     sudo apt-get update && sudo apt-get install -y apache2
 
+Forgot the password? Read it from the credential store (SSH login itself
+is key-only and never needs it):
+    cat $CRED_FILE   # file is mode 0600, owned by $REAL_USER
+
 Browse the guest's website from the host's Firefox via the SSH tunnel
 (any \`ssh $VM_NAME\` session activates the forward):
     http://localhost:8080
