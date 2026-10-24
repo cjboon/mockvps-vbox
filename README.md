@@ -72,8 +72,11 @@ Then open `http://localhost:8080` in your host browser while an `ssh mockvps-vbo
 | `--require-signature` | fail if the ISO checksum file's GPG signature cannot be verified |
 | `--cd-key-fpr FPR` | accept an additional Debian CD signing key |
 | `-y, --yes` | non-interactive; confirms prompts |
+| `--uninstall` | remove everything the script created for this VM (see [Uninstalling](#uninstalling)) |
+| `--dry-run` | with `--uninstall`: list what would be removed and stop there |
+| `--keep-iso` | with `--uninstall`: keep the downloaded Debian netinst ISO |
 
-Every option also exists as an environment variable (`VM_NAME`, `VM_USER`, `SSH_HOST_PORT`, `VM_VCPUS`, `VM_MEMORY`, `VM_DISK_SIZE_MB`, `WORKDIR`, `ISO_URL`, `SSH_HOST_IP`, `MANUAL`, `SERIAL`, `STOP_KVM`, `REQUIRE_SIG`, `WEB_TUNNEL=0|1`, `FORWARDS="8443:443,3000:3000"`). Flags win over environment variables.
+Every option also exists as an environment variable (`VM_NAME`, `VM_USER`, `SSH_HOST_PORT`, `VM_VCPUS`, `VM_MEMORY`, `VM_DISK_SIZE_MB`, `WORKDIR`, `ISO_URL`, `SSH_HOST_IP`, `MANUAL`, `SERIAL`, `STOP_KVM`, `REQUIRE_SIG`, `WEB_TUNNEL=0|1`, `UNINSTALL=1`, `DRY_RUN=1`, `KEEP_ISO=1`, `FORWARDS="8443:443,3000:3000"`). Flags win over environment variables.
 
 ### Exit codes
 
@@ -153,14 +156,36 @@ Before editing `~/.ssh/config`, the script saves a copy as `~/.ssh/config.mockvp
 
 ## Uninstalling
 
+The script knows exactly what it created, so it can remove it:
+
+```
+./mockvps-vbox.sh --uninstall --dry-run    # preview: lists what would be removed
+./mockvps-vbox.sh --uninstall             # then approve once, and it tears down
+```
+
+`--uninstall` removes the VM (registration, disk, unattended-install logs; a
+running VM is powered off gracefully first), the workdir files for that name
+(`~/vps/<name>.vdi`, credentials, preseed copy, serial log, checksum
+artifacts), the generated Debian ISO (keep it with `--keep-iso`),
+`~/.ssh/<name>_id[.pub]`, its managed block in `~/.ssh/config`, and the
+matching known-hosts entries. Use `-n NAME` / `-w DIR` / `-p PORT` to match a
+non-default install. The pre-change ssh config is kept as
+`~/.ssh/config.mockvps.bak`, so mistakes are reversible.
+
+It deliberately does **not** touch the repo itself, the VirtualBox packages,
+or your `vboxusers` membership — the final report prints the exact commands
+for those if you ever want a fully clean host. The same applies when a
+guest of *another* name shares the workdir: only that VM's files go.
+
+Manual teardown (equivalent of what `--uninstall` does) for reference:
+
 ```
 VBoxManage unregistervm mockvps-vbox --delete     # use your VM's name
 rm -rf ~/vps                                      # disk, credentials, ISO, templates
 rm -f ~/.ssh/mockvps-vbox_id ~/.ssh/mockvps-vbox_id.pub
 ssh-keygen -R mockvps-vbox
+ssh-keygen -R '[127.0.0.1]:2222'                  # then drop the managed block in ~/.ssh/config
 ```
-
-Then delete the block between the `# BEGIN mockvps-vbox:<name>` and `# END mockvps-vbox:<name>` lines in `~/.ssh/config`.
 
 ## Troubleshooting
 

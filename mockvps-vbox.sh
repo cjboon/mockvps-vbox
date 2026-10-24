@@ -14,7 +14,9 @@
 #   * verifies the Debian ISO (SHA512SUMS + GPG signature),
 #   * uses a SATA controller, compares port *and* IP of the NAT rule,
 #     clears stale known_hosts entries, replaces the TCP serial listener with
-#     a log file, and supports extra SSH tunnels (-f/--forward).
+#     a log file, and supports extra SSH tunnels (-f/--forward),
+#   * can remove everything it created again (--uninstall, with a --dry-run
+#     preview, and --keep-iso to keep the downloaded ISO).
 #
 # Security model:
 #   * The NAT port-forward is bound to 127.0.0.1 -- other machines on the LAN
@@ -99,10 +101,19 @@ options:
   --cd-key-fpr FPR      accept this additional Debian CD signing key
   --no-web-tunnel       do not add the default 8080 -> guest:80 tunnel
 
+uninstall mode:
+  --uninstall           remove every trace of the VM: registration, disk,
+                        keys, credentials, the ssh config block and the
+                        workdir files (ISO too, unless --keep-iso). The
+                        repo itself and the VirtualBox packages are kept.
+                        With -y it also powers off a running VM gracefully.
+  --dry-run             only with --uninstall: list what would be removed
+  --keep-iso            only with --uninstall: keep the downloaded Debian ISO
+
 Every option has an environment-variable equivalent (VM_NAME, VM_USER,
 SSH_HOST_PORT, VM_VCPUS, VM_MEMORY, VM_DISK_SIZE_MB, WORKDIR, ISO_URL,
 SSH_HOST_IP, MANUAL, SERIAL, STOP_KVM, REQUIRE_SIG, WEB_TUNNEL=0|1,
-FORWARDS="8443:443,3000:3000"); flags win.
+UNINSTALL=1, DRY_RUN=1, KEEP_ISO=1, FORWARDS="8443:443,3000:3000"); flags win.
 EOF
 }
 
@@ -124,6 +135,9 @@ init_defaults() {
   SERIAL="${SERIAL:-0}"
   STOP_KVM="${STOP_KVM:-0}"
   REQUIRE_SIG="${REQUIRE_SIG:-0}"
+  UNINSTALL="${UNINSTALL:-0}"
+  DRY_RUN="${DRY_RUN:-0}"
+  KEEP_ISO="${KEEP_ISO:-0}"
   WEB_TUNNEL="${WEB_TUNNEL:-1}"
   FORWARDS="${FORWARDS:-}"
   REAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
@@ -161,6 +175,9 @@ parse_args() {
       --stop-kvm) STOP_KVM=1; shift ;;
       --require-signature) REQUIRE_SIG=1; shift ;;
       --no-web-tunnel) WEB_TUNNEL=0; shift ;;
+      --uninstall) UNINSTALL=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --keep-iso) KEEP_ISO=1; shift ;;
       --) shift; break ;;
       -*) die "unknown option: $1 (try --help)" ;;
       *) die "unexpected argument: $1 (no positional parameters; try --help)" ;;
@@ -788,8 +805,12 @@ write_ssh_block() {
 }
 
 forget_old_host_keys() {
-  ssh-keygen -R "$VM_NAME" >/dev/null 2>&1 || true
-  ssh-keygen -R "[$SSH_HOST_IP]:$SSH_HOST_PORT" >/dev/null 2>&1 || true
+  local kh="$HOME/.ssh/known_hosts"
+  [[ -f "$kh" ]] || return 0
+  # -f is explicit on purpose: ssh-keygen -R resolves ~ from the passwd entry,
+  # not from $HOME, which breaks under an overridden HOME (e.g. tests).
+  ssh-keygen -R "$VM_NAME" -f "$kh" >/dev/null 2>&1 || true
+  ssh-keygen -R "[$SSH_HOST_IP]:$SSH_HOST_PORT" -f "$kh" >/dev/null 2>&1 || true
 }
 
 ssh_banner_ready() {
@@ -827,6 +848,133 @@ wait_for_ssh() {
     sleep 10
   done
   return 1
+}
+
+### Uninstall mode #####################################################
+
+# Lists only the artifacts that currently exist (or are explicitly kept).
+uninstall_items() {
+  local f reg=0
+  if command -v VBoxManage >/dev/null 2>&1 && vm_exists; then
+    echo "vbox-vm    VBox VM '$VM_NAME' (registration, disk state, Unattended-* logs)"
+    reg=1
+  fi
+  if [[ -e "$DISK" ]]; then echo "file       $DISK"; fi
+  if [[ $reg -eq 0 && -d "$HOME/VirtualBox VMs/$VM_NAME" ]]; then
+    echo "dir        $HOME/VirtualBox VMs/$VM_NAME (leftover VM folder)"
+  fi
+  if [[ -f "$CRED_FILE" ]]; then echo "file       $CRED_FILE (guest sudo password)"; fi
+  if [[ -f "$WORKDIR/credentials/${VM_NAME}.pwfile" ]]; then
+    echo "file       $WORKDIR/credentials/${VM_NAME}.pwfile (install-time temp)"
+  fi
+  if [[ -f "$WORKDIR/templates/debian_preseed.cfg" ]]; then
+    echo "file       $WORKDIR/templates/debian_preseed.cfg (preseed copy)"
+  fi
+  if [[ $KEEP_ISO -eq 0 ]]; then
+    for f in "$WORKDIR"/debian-*-amd64-netinst.iso "$WORKDIR"/debian-*-amd64-netinst.iso.part; do
+      if [[ -e "$f" ]]; then echo "file       $f (install ISO)"; fi
+    done
+    if [[ -d "$WORKDIR/verify" ]]; then echo "dir        $WORKDIR/verify (ISO checksum artifacts)"; fi
+  else
+    if [[ -d "$WORKDIR/verify" ]]; then
+      echo "keep       $WORKDIR/*.iso and $WORKDIR/verify (kept: --keep-iso)"
+    fi
+  fi
+  if [[ -f "$SERIAL_LOG" ]]; then echo "file       $SERIAL_LOG"; fi
+  if [[ -f "$KEY_FILE" ]]; then echo "file       $KEY_FILE"; fi
+  if [[ -f "$KEY_FILE.pub" ]]; then echo "file       $KEY_FILE.pub"; fi
+  if [[ -f "$HOME/.ssh/config" ]]; then
+    if grep -qxF "$SSH_BEGIN" "$HOME/.ssh/config" && ! grep -qxF "$SSH_END" "$HOME/.ssh/config"; then
+      die "$HOME/.ssh/config has a '$SSH_BEGIN' line but no matching END line; fix it by hand and re-run."
+    fi
+    if grep -qxF "$SSH_BEGIN" "$HOME/.ssh/config" || grep -qxF "$SSH_LEGACY" "$HOME/.ssh/config"; then
+      echo "ssh-block  $HOME/.ssh/config (managed block for '$VM_NAME')"
+    fi
+  fi
+  if [[ -f "$HOME/.ssh/known_hosts" ]]; then
+    echo "known-hosts  entries for '$VM_NAME' and [$SSH_HOST_IP]:$SSH_HOST_PORT in ~/.ssh/known_hosts"
+  fi
+  return 0
+}
+
+# Removes exactly this VM's managed block (modern BEGIN/END and the legacy
+# single-comment format), keeping everything else byte-identical. Keeps a
+# fresh backup (the pre-uninstall config) in ~/.ssh/config.mockvps.bak.
+remove_ssh_block() {
+  local cfg="$HOME/.ssh/config" out
+  [[ -f "$cfg" ]] || return 0
+  cp -p "$cfg" "$cfg.mockvps.bak"
+  out="$(mktemp)"; chmod 600 "$out"
+  awk -v begin="$SSH_BEGIN" -v end="$SSH_END" -v legacy="$SSH_LEGACY" \
+      -v host="Host $VM_NAME" '
+    $0 == begin   { skip = 1; next }
+    skip          { if ($0 == end) skip = 0; next }
+    $0 == legacy  { legacy_mode = 1; next }
+    legacy_mode   { if ($0 == host || $0 ~ /^[ \t]/) next; legacy_mode = 0 }
+    { print }
+  ' "$cfg" > "$out"
+  cat "$out" > "$cfg"     # keep the inode, so a symlinked config still works
+  rm -f "$out"; chmod 600 "$cfg"
+}
+
+uninstall_run() {
+  local cfg="$HOME/.ssh/config" f
+  log "Uninstall plan for VM '$VM_NAME' (workdir: $WORKDIR)"
+  uninstall_items
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "dry-run: nothing was removed. Re-run without --dry-run to delete for real."
+    return 0
+  fi
+  confirm "Permanently delete everything listed above?" || die "Aborted; nothing was removed."
+
+  if command -v VBoxManage >/dev/null 2>&1 && vm_exists; then
+    log "Removing VM '$VM_NAME' (graceful ACPI shutdown first; hard stop after 2 minutes)"
+    remove_vm
+  fi
+  if [[ -d "$HOME/VirtualBox VMs/$VM_NAME" ]]; then
+    log "Removing leftover VM folder"
+    rm -rf "$HOME/VirtualBox VMs/$VM_NAME"
+  fi
+
+  # Workdir artifacts, one explicit path at a time.
+  rm -f -- "$DISK" "$SERIAL_LOG" "$CRED_FILE" "$WORKDIR/credentials/${VM_NAME}.pwfile"
+  if [[ $KEEP_ISO -eq 0 ]]; then
+    for f in "$WORKDIR"/debian-*-amd64-netinst.iso "$WORKDIR"/debian-*-amd64-netinst.iso.part; do
+      if [[ -e "$f" ]]; then rm -f -- "$f"; fi
+    done
+    if [[ -d "$WORKDIR/verify" ]]; then rm -rf "$WORKDIR/verify"; fi
+  fi
+  if [[ -f "$WORKDIR/templates/debian_preseed.cfg" ]]; then
+    rm -f "$WORKDIR/templates/debian_preseed.cfg"
+    rmdir "$WORKDIR/templates" 2>/dev/null || true
+  fi
+  rmdir "$CRED_DIR" 2>/dev/null || true
+  if [[ -d "$WORKDIR" ]] && [[ -z "$(find "$WORKDIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+    rmdir "$WORKDIR" || true
+  fi
+
+  # Keys, ssh config block, known hosts.
+  rm -f -- "$KEY_FILE" "$KEY_FILE.pub"
+  remove_ssh_block
+  if [[ -f "$HOME/.ssh/known_hosts" ]]; then
+    forget_old_host_keys
+  fi
+
+  log "Removal of '$VM_NAME' is complete."
+  if [[ -d "$WORKDIR" ]]; then
+    warn "Workdir not fully empty: $WORKDIR (kept artifacts above, e.g. --keep-iso)"
+  fi
+  if [[ -f "$cfg.mockvps.bak" ]]; then
+    log "Kept a restore point: $cfg.mockvps.bak (delete it when everything looks right)."
+  fi
+  cat <<EOF
+
+Deliberately NOT touched (do these yourself if you truly want a clean slate):
+  * this repo:            rm -rf "$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  * the VirtualBox packages:  sudo apt-get purge '~nvirtualbox' && sudo apt-get autoremove
+  * the vboxusers group member:  sudo deluser $REAL_USER vboxusers
+  * ~/.ssh/known_hosts.old, if ssh-keygen -R removed entries just now
+EOF
 }
 
 ### Main ##############################################################
@@ -867,6 +1015,7 @@ Management ($VM_NAME):
   VM status         : VBoxManage list runningvms
   snapshot clean    : VBoxManage snapshot "$VM_NAME" take clean
   restore snapshot  : VBoxManage snapshot "$VM_NAME" restore clean
+  uninstall all     : mockvps-vbox.sh --uninstall   (add --dry-run to preview)
 EOF
   if [[ "$SERIAL" == "1" ]]; then echo "  serial log        : $SERIAL_LOG"; fi
   if [[ -n "$KVM_RESTORE_HINT" ]]; then
@@ -878,6 +1027,20 @@ main() {
   local rc state
   init_defaults
   parse_args "$@"
+
+  if [[ $UNINSTALL -eq 1 ]]; then
+    [[ "$(uname -s)" == "Linux" ]] || die "This script supports Linux hosts only."
+    [[ "$VM_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] \
+      || die "VM_NAME must be 1-64 chars [A-Za-z0-9_.-] and not start with - or . (got '$VM_NAME')"
+    is_uint "$SSH_HOST_PORT" 1 65535 || die "SSH_HOST_PORT must be 1-65535 (got '$SSH_HOST_PORT')"
+    SSH_HOST_PORT=$((10#$SSH_HOST_PORT))
+    derive_paths
+    uninstall_run
+    return 0
+  fi
+  [[ $DRY_RUN -eq 0 ]] || die "--dry-run is only meaningful with --uninstall"
+  [[ $KEEP_ISO -eq 0 ]] || die "--keep-iso is only meaningful with --uninstall"
+
   validate_config
   derive_paths
 
