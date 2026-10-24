@@ -109,11 +109,16 @@ uninstall mode:
                         With -y it also powers off a running VM gracefully.
   --dry-run             only with --uninstall: list what would be removed
   --keep-iso            only with --uninstall: keep the downloaded Debian ISO
+  --purge-software      only with --uninstall: ALSO purge the VirtualBox
+                        packages, drop Oracle's apt repo entry + keyring and
+                        revoke the vboxusers group membership (uses sudo).
+                        Refuses to run if other VirtualBox VMs still exist.
 
 Every option has an environment-variable equivalent (VM_NAME, VM_USER,
 SSH_HOST_PORT, VM_VCPUS, VM_MEMORY, VM_DISK_SIZE_MB, WORKDIR, ISO_URL,
 SSH_HOST_IP, MANUAL, SERIAL, STOP_KVM, REQUIRE_SIG, WEB_TUNNEL=0|1,
-UNINSTALL=1, DRY_RUN=1, KEEP_ISO=1, FORWARDS="8443:443,3000:3000"); flags win.
+UNINSTALL=1, DRY_RUN=1, KEEP_ISO=1, PURGE_SOFTWARE=1,
+FORWARDS="8443:443,3000:3000"); flags win.
 EOF
 }
 
@@ -138,6 +143,9 @@ init_defaults() {
   UNINSTALL="${UNINSTALL:-0}"
   DRY_RUN="${DRY_RUN:-0}"
   KEEP_ISO="${KEEP_ISO:-0}"
+  PURGE_SOFTWARE="${PURGE_SOFTWARE:-0}"
+  ORACLE_RULE_FILE="${ORACLE_RULE_FILE:-/etc/apt/sources.list.d/virtualbox.list}"
+  ORACLE_KEYRING_FILE="${ORACLE_KEYRING_FILE:-/usr/share/keyrings/oracle-virtualbox-2016.gpg}"
   WEB_TUNNEL="${WEB_TUNNEL:-1}"
   FORWARDS="${FORWARDS:-}"
   REAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
@@ -178,6 +186,7 @@ parse_args() {
       --uninstall) UNINSTALL=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       --keep-iso) KEEP_ISO=1; shift ;;
+      --purge-software) PURGE_SOFTWARE=1; shift ;;
       --) shift; break ;;
       -*) die "unknown option: $1 (try --help)" ;;
       *) die "unexpected argument: $1 (no positional parameters; try --help)" ;;
@@ -859,6 +868,18 @@ uninstall_items() {
     echo "vbox-vm    VBox VM '$VM_NAME' (registration, disk state, Unattended-* logs)"
     reg=1
   fi
+  if [[ $PURGE_SOFTWARE -eq 1 ]]; then
+    local vp
+    vp="$(dpkg -l 2>/dev/null | awk '$1 == "ii" && $2 ~ /^virtualbox/ { print $2 }')"
+    if [[ -n "$vp" ]]; then echo "software   VirtualBox packages: ${vp//$'\n'/, }"; fi
+    if [[ -f "$ORACLE_RULE_FILE" ]]; then echo "software   $ORACLE_RULE_FILE (Oracle's apt repo entry)"; fi
+    if [[ -f "$ORACLE_KEYRING_FILE" ]]; then echo "software   $ORACLE_KEYRING_FILE (Oracle apt keyring)"; fi
+    if id -nG "$REAL_USER" 2>/dev/null | grep -qw vboxusers; then
+      echo "software   vboxusers group membership for $REAL_USER"
+    fi
+  else
+    echo "keep       VirtualBox software and its apt repo (add --purge-software to remove)"
+  fi
   if [[ -e "$DISK" ]]; then echo "file       $DISK"; fi
   if [[ $reg -eq 0 && -d "$HOME/VirtualBox VMs/$VM_NAME" ]]; then
     echo "dir        $HOME/VirtualBox VMs/$VM_NAME (leftover VM folder)"
@@ -919,6 +940,82 @@ remove_ssh_block() {
   rm -f "$out"; chmod 600 "$cfg"
 }
 
+# opt-in host-level purge (--purge-software): removes VirtualBox and the
+# Oracle apt repo, drops group membership, and clears VirtualBox's home dirs.
+# Refuses when other VirtualBox VMs still exist -- they are not ours to kill.
+purge_host_software() {
+  local pkgs other line members
+  other=()
+  if command -v VBoxManage >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      line="${line%\"*}"; line="${line#\"}"
+      [[ -n "$line" ]] && other+=("VM $line")
+    done < <(vb list vms 2>/dev/null || true)
+  fi
+  if [[ -d "$HOME/VirtualBox VMs" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && other+=("folder $line")
+    done < <(find "$HOME/VirtualBox VMs" -mindepth 1 -maxdepth 1 -print 2>/dev/null || true)
+  fi
+  if [[ ${#other[@]} -gt 0 ]]; then
+    die "Refusing --purge-software: other VirtualBox VMs are still present:
+${other[*]}
+Remove those yourself; they are not this script's to delete."
+  fi
+
+  confirm "Purge the VirtualBox packages, Oracle's apt repo + keyring, and drop the vboxusers membership? (uses sudo)" \
+    || die "Software purge skipped; everything else was removed."
+
+  pkgs="$(dpkg -l 2>/dev/null | awk '$1 == "ii" && $2 ~ /^virtualbox/ { print $2 }')"
+  if [[ -n "$pkgs" ]]; then
+    log "Purging: $(printf '%s' "$pkgs" | tr '\n' ' ')"
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get purge -y $pkgs \
+      || warn "apt-get purge failed; clean it up manually if wanted."
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y \
+      || warn "apt-get autoremove failed; run it manually if wanted."
+    if module_loaded; then
+      as_root modprobe -r vboxpci vboxnetadp vboxnetflt vboxdrvu vboxdrv 2>/dev/null || true
+    fi
+  else
+    log "No VirtualBox packages are installed via dpkg; nothing to purge."
+  fi
+
+  if [[ -f "$ORACLE_RULE_FILE" ]] && grep -q download.virtualbox.org "$ORACLE_RULE_FILE"; then
+    as_root rm -f "$ORACLE_RULE_FILE"
+    log "Removed Oracle apt repo entry: $ORACLE_RULE_FILE"
+    if [[ -f "$ORACLE_KEYRING_FILE" ]]; then as_root rm -f "$ORACLE_KEYRING_FILE"; fi
+    as_root apt-get update >/dev/null 2>&1 || warn "Run 'sudo apt-get update' once to refresh apt indexes."
+  else
+    [[ -f "$ORACLE_RULE_FILE" ]] && warn "Kept $ORACLE_RULE_FILE (it does not point at Oracle's repo; check it by hand)."
+    if command -v VBoxManage >/dev/null 2>&1 && grep -Rlqs -- "$ORACLE_KEYRING_FILE" /etc/apt/sources.list.d/ 2>/dev/null | grep -q .; then
+      as_root rm -f "$ORACLE_KEYRING_FILE"
+      log "Removed unused Oracle apt keyring: $ORACLE_KEYRING_FILE"
+    fi
+  fi
+
+  if id -nG "$REAL_USER" 2>/dev/null | grep -qw vboxusers; then
+    as_root deluser "$REAL_USER" vboxusers || true
+    log "Revoked vboxusers membership for $REAL_USER"
+  fi
+  if getent group vboxusers >/dev/null 2>&1; then
+    members="$(getent group vboxusers | cut -d: -f4)"
+    if [[ -z "$members" ]]; then
+      as_root groupdel vboxusers 2>/dev/null || true
+      log "Removed the now-empty vboxusers group"
+    fi
+  fi
+
+  if [[ -d "$HOME/.config/VirtualBox" ]]; then
+    rm -rf "$HOME/.config/VirtualBox"
+    log "Removed VirtualBox's per-user config: ~/.config/VirtualBox"
+  fi
+  if [[ -d "$HOME/.VirtualBox" ]]; then
+    rm -rf "$HOME/.VirtualBox"
+    log "Removed legacy VirtualBox config dir: ~/.VirtualBox"
+  fi
+  rmdir "$HOME/VirtualBox VMs" 2>/dev/null || true
+}
+
 uninstall_run() {
   local cfg="$HOME/.ssh/config" f
   log "Uninstall plan for VM '$VM_NAME' (workdir: $WORKDIR)"
@@ -962,6 +1059,10 @@ uninstall_run() {
     forget_old_host_keys
   fi
 
+  if [[ $PURGE_SOFTWARE -eq 1 ]]; then
+    purge_host_software
+  fi
+
   log "Removal of '$VM_NAME' is complete."
   if [[ -d "$WORKDIR" ]]; then
     warn "Workdir not fully empty: $WORKDIR (kept artifacts above, e.g. --keep-iso)"
@@ -974,7 +1075,14 @@ uninstall_run() {
   local script_path repo_dir
   script_path="$(readlink -f -- "${BASH_SOURCE[0]:-$0}" 2>/dev/null)" || script_path="${BASH_SOURCE[0]:-$0}"
   repo_dir="$(dirname -- "$script_path")"
-  cat <<EOF
+  if [[ $PURGE_SOFTWARE -eq 1 ]]; then
+    cat <<EOF
+
+Host software purged (see the log above). If the Oracle repo was removed,
+run 'sudo apt-get update' once to refresh your apt indexes.
+EOF
+  else
+    cat <<EOF
 
 Deliberately NOT touched (do these yourself if you truly want a clean slate):
   * this repo:            rm -rf "$repo_dir"
@@ -982,6 +1090,7 @@ Deliberately NOT touched (do these yourself if you truly want a clean slate):
   * the vboxusers group member:  sudo deluser $REAL_USER vboxusers
   * ~/.ssh/known_hosts.old, if ssh-keygen -R removed entries just now
 EOF
+  fi
 }
 
 ### Main ##############################################################
@@ -1047,6 +1156,7 @@ main() {
   fi
   [[ $DRY_RUN -eq 0 ]] || die "--dry-run is only meaningful with --uninstall"
   [[ $KEEP_ISO -eq 0 ]] || die "--keep-iso is only meaningful with --uninstall"
+  [[ $PURGE_SOFTWARE -eq 0 ]] || die "--purge-software is only meaningful with --uninstall"
 
   validate_config
   derive_paths

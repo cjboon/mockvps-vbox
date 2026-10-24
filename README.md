@@ -75,6 +75,7 @@ Then open `http://localhost:8080` in your host browser while an `ssh mockvps-vbo
 | `--uninstall` | remove everything the script created for this VM (see [Uninstalling](#uninstalling)) |
 | `--dry-run` | with `--uninstall`: list what would be removed and stop there |
 | `--keep-iso` | with `--uninstall`: keep the downloaded Debian netinst ISO |
+| `--purge-software` | with `--uninstall`: also purge VirtualBox, drop Oracle's apt repo + keyring and the `vboxusers` membership (sudo; refuses while other VMs exist) |
 
 Every option also exists as an environment variable (`VM_NAME`, `VM_USER`, `SSH_HOST_PORT`, `VM_VCPUS`, `VM_MEMORY`, `VM_DISK_SIZE_MB`, `WORKDIR`, `ISO_URL`, `SSH_HOST_IP`, `MANUAL`, `SERIAL`, `STOP_KVM`, `REQUIRE_SIG`, `WEB_TUNNEL=0|1`, `UNINSTALL=1`, `DRY_RUN=1`, `KEEP_ISO=1`, `FORWARDS="8443:443,3000:3000"`). Flags win over environment variables.
 
@@ -172,12 +173,26 @@ matching known-hosts entries. Use `-n NAME` / `-w DIR` / `-p PORT` to match a
 non-default install. The pre-change ssh config is kept as
 `~/.ssh/config.mockvps.bak`, so mistakes are reversible.
 
-It deliberately does **not** touch the repo itself, the VirtualBox packages,
-or your `vboxusers` membership — the final report prints the exact commands
-for those if you ever want a fully clean host. The same applies when a
-guest of *another* name shares the workdir: only that VM's files go.
+It deliberately does **not** touch the repo itself. It also leaves the
+*VirtualBox software* alone by default — running `--uninstall` twice on a
+machine that hosts other VMs must stay safe. For a truly clean host, add
+`--purge-software`:
 
-Manual teardown (equivalent of what `--uninstall` does) for reference:
+```
+./mockvps-vbox.sh --uninstall --purge-software --yes
+```
+
+It then purges the installed VirtualBox packages, runs
+`apt-get autoremove --purge`, unloads the kernel modules, removes Oracle's
+apt repo entry + keyring (only when they point at Oracle's repo), deletes
+VirtualBox's per-user config dirs, revokes your `vboxusers` membership, and
+removes the group if it becomes empty. Safety rails: it **refuses to run**
+while other VirtualBox VMs (or their folders) still exist, shows exactly
+what would go in `--dry-run`, and requires sudo interactively for the
+package stage. End of `--purge-software`: run `sudo apt-get update` once to
+refresh the apt indexes.
+
+For reference, the manual equivalent:
 
 ```
 VBoxManage unregistervm mockvps-vbox --delete     # use your VM's name
