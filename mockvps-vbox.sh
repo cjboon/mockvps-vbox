@@ -891,7 +891,9 @@ uninstall_items() {
       echo "ssh-block  $HOME/.ssh/config (managed block for '$VM_NAME')"
     fi
   fi
-  if [[ -f "$HOME/.ssh/known_hosts" ]]; then
+  if [[ -f "$HOME/.ssh/known_hosts" ]] \
+     && { grep -qE "(^|,)$VM_NAME(,| )" "$HOME/.ssh/known_hosts" \
+          || grep -qF "[$SSH_HOST_IP]:$SSH_HOST_PORT" "$HOME/.ssh/known_hosts"; }; then
     echo "known-hosts  entries for '$VM_NAME' and [$SSH_HOST_IP]:$SSH_HOST_PORT in ~/.ssh/known_hosts"
   fi
   return 0
@@ -967,10 +969,15 @@ uninstall_run() {
   if [[ -f "$cfg.mockvps.bak" ]]; then
     log "Kept a restore point: $cfg.mockvps.bak (delete it when everything looks right)."
   fi
+  # Resolve the REAL script location (readlink -f follows any symlink), so the
+  # printed repo path is never something dangerous like $HOME.
+  local script_path repo_dir
+  script_path="$(readlink -f -- "${BASH_SOURCE[0]:-$0}" 2>/dev/null)" || script_path="${BASH_SOURCE[0]:-$0}"
+  repo_dir="$(dirname -- "$script_path")"
   cat <<EOF
 
 Deliberately NOT touched (do these yourself if you truly want a clean slate):
-  * this repo:            rm -rf "$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  * this repo:            rm -rf "$repo_dir"
   * the VirtualBox packages:  sudo apt-get purge '~nvirtualbox' && sudo apt-get autoremove
   * the vboxusers group member:  sudo deluser $REAL_USER vboxusers
   * ~/.ssh/known_hosts.old, if ssh-keygen -R removed entries just now
